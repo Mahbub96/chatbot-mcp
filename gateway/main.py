@@ -1,4 +1,8 @@
 import json
+import asyncio
+import time
+from collections import defaultdict
+
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -9,6 +13,24 @@ app = FastAPI()
 
 MODEL_NAME = "local-mcp-model"
 
+# =========================
+# SIMPLE RATE LIMIT (ANTI 429 STORM)
+# =========================
+request_tracker = defaultdict(list)
+RATE_LIMIT_WINDOW = 10  # seconds
+MAX_REQUESTS = 10       # per IP per window
+
+
+def is_rate_limited(ip: str):
+    now = time.time()
+    request_tracker[ip] = [t for t in request_tracker[ip] if now - t < RATE_LIMIT_WINDOW]
+
+    if len(request_tracker[ip]) >= MAX_REQUESTS:
+        return True
+
+    request_tracker[ip].append(now)
+    return False
+
 
 # =========================
 # SYSTEM PROMPT
@@ -16,42 +38,27 @@ MODEL_NAME = "local-mcp-model"
 SYSTEM_PROMPT = """
 You are a helpful local AI assistant.
 Be natural, human-like, and concise.
-You can help with coding, reasoning, and tool usage when needed.
-Do not mention internal system details or architecture.
+Do not mention internal system or model details.
 """
 
 
 # =========================
-# SAFE HELPERS
+# HELPERS
 # =========================
 def safe_messages(messages):
-    """Ensure messages are always valid list[dict]."""
     if not isinstance(messages, list):
         return []
-    cleaned = []
-    for m in messages:
-        if isinstance(m, dict) and "role" in m:
-            cleaned.append(m)
-    return cleaned
+    return [m for m in messages if isinstance(m, dict)]
+
+
+def inject_system(messages):
+    if not any(m.get("role") == "system" for m in messages):
+        messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+    return messages
 
 
 def has_multimodal(messages):
-    """Detect image / multimodal input safely."""
-    for m in messages:
-        content = m.get("content")
-        if isinstance(content, list):
-            return True
-    return False
-
-
-def ensure_system_prompt(messages):
-    """Inject system prompt if missing."""
-    if not any(m.get("role") == "system" for m in messages):
-        messages.insert(0, {
-            "role": "system",
-            "content": SYSTEM_PROMPT
-        })
-    return messages
+    return any(isinstance(m.get("content"), list) for m in messages)
 
 
 # =========================
@@ -64,7 +71,7 @@ def execute_tool(payload: dict):
         args = payload.get("arguments", {})
 
         if not name:
-            return {"success": False, "error": "Tool name missing"}
+            return {"success": False, "error": "Missing tool name"}
 
         if not isinstance(args, dict):
             args = {}
@@ -78,10 +85,7 @@ def execute_tool(payload: dict):
         }
 
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}
 
 
 # =========================
@@ -96,9 +100,7 @@ def list_tools():
                 "description": "Read file from disk",
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "path": {"type": "string"}
-                    },
+                    "properties": {"path": {"type": "string"}},
                     "required": ["path"]
                 }
             },
@@ -119,7 +121,7 @@ def list_tools():
 
 
 # =========================
-# OPENAI COMPAT: MODELS
+# OPENAI MODELS
 # =========================
 @app.get("/v1/models")
 def models():
@@ -130,34 +132,42 @@ def models():
                 "id": MODEL_NAME,
                 "object": "model",
                 "created": 0,
-                "owned_by": "local-mcp"
+                "owned_by": "local"
             }
         ]
     }
 
 
 # =========================
-# OPENAI COMPAT: CHAT
+# CHAT COMPLETIONS
 # =========================
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+
+    ip = request.client.host
+
+    # ---- RATE LIMIT PROTECTION ----
+    if is_rate_limited(ip):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Too many requests. Please slow down."}
+        )
+
     try:
         body = await request.json()
     except Exception:
         body = {}
 
-    messages = safe_messages(body.get("messages", []))
+    messages = inject_system(safe_messages(body.get("messages", [])))
     stream = body.get("stream", True)
-
-    messages = ensure_system_prompt(messages)
 
     async def generate():
 
         # -------------------------
-        # MULTIMODAL SAFE FALLBACK
+        # MULTIMODAL SAFE RESPONSE
         # -------------------------
         if has_multimodal(messages):
-            msg = "This model does not support image input yet."
+            msg = "This model currently does not support image input."
 
             chunk = {
                 "id": "chatcmpl-local",
@@ -177,12 +187,12 @@ async def chat_completions(request: Request):
             return
 
         # -------------------------
-        # STREAM RESPONSE
+        # STREAM LLM
         # -------------------------
         try:
             async for token in stream_llm(messages):
 
-                if token is None:
+                if not token:
                     continue
 
                 chunk = {
@@ -201,34 +211,31 @@ async def chat_completions(request: Request):
                 yield f"data: {json.dumps(chunk)}\n\n"
 
         except Exception as e:
-            err = {
-                "error": str(e)
-            }
 
-            chunk = {
+            error_chunk = {
                 "id": "chatcmpl-local",
                 "object": "chat.completion.chunk",
                 "model": MODEL_NAME,
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"content": f"\n[ERROR] {err}"},
+                        "delta": {"content": f"\n[LLM ERROR] {str(e)}"},
                         "finish_reason": "stop"
                     }
                 ]
             }
 
-            yield f"data: {json.dumps(chunk)}\n\n"
+            yield f"data: {json.dumps(error_chunk)}\n\n"
 
         yield "data: [DONE]\n\n"
 
     # -------------------------
-    # STREAM OR NON-STREAM
+    # RETURN STREAM OR NORMAL
     # -------------------------
     if stream:
         return StreamingResponse(generate(), media_type="text/event-stream")
 
-    # fallback non-stream
+    # non-stream fallback
     result = ""
     try:
         async for token in stream_llm(messages):
@@ -252,7 +259,7 @@ async def chat_completions(request: Request):
 
 
 # =========================
-# CLEAN SHUTDOWN
+# CLEANUP
 # =========================
 @app.on_event("shutdown")
 async def shutdown():
