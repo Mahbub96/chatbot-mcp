@@ -1,5 +1,4 @@
 #!/bin/bash
-
 set -e
 
 echo "🚀 Starting FULL STACK (MCP + Open WebUI)..."
@@ -17,7 +16,7 @@ VOLUME_DATA="open-webui-data"
 VOLUME_HF="hf-cache"
 
 # =========================
-# CLEAN
+# CLEANUP
 # =========================
 echo "🧹 Cleaning old services..."
 
@@ -36,10 +35,10 @@ else
   exit 1
 fi
 
-echo "📡 Using MCP app: $MCP_APP"
+echo "📡 MCP app: $MCP_APP"
 
 # =========================
-# START MCP (FIXED)
+# START MCP
 # =========================
 echo "📡 Starting MCP server..."
 
@@ -54,19 +53,16 @@ MCP_PID=$!
 echo "📌 MCP PID: $MCP_PID"
 
 # =========================
-# WAIT FOR MCP (FIXED CHECK)
+# WAIT FOR MCP
 # =========================
 echo "⏳ Waiting for MCP API..."
 
 for i in {1..40}; do
-
-  # generic health check (SAFE)
-  if curl -s http://127.0.0.1:$MCP_PORT/ >/dev/null 2>&1; then
-    echo "✅ MCP is responding"
+  if curl -s http://127.0.0.1:$MCP_PORT/v1/models >/dev/null 2>&1; then
+    echo "✅ MCP is ready"
     break
   fi
 
-  # process check
   if ! kill -0 $MCP_PID >/dev/null 2>&1; then
     echo "❌ MCP crashed"
     tail -n 50 mcp.log
@@ -77,9 +73,11 @@ for i in {1..40}; do
   sleep 1
 done
 
-# FINAL HARD CHECK
-if ! kill -0 $MCP_PID >/dev/null 2>&1; then
-  echo "❌ MCP failed"
+# =========================
+# FINAL CHECK
+# =========================
+if ! curl -s http://127.0.0.1:$MCP_PORT/v1/models >/dev/null 2>&1; then
+  echo "❌ MCP failed to start properly"
   tail -n 50 mcp.log
   exit 1
 fi
@@ -91,7 +89,7 @@ docker volume inspect $VOLUME_DATA >/dev/null 2>&1 || docker volume create $VOLU
 docker volume inspect $VOLUME_HF >/dev/null 2>&1 || docker volume create $VOLUME_HF
 
 # =========================
-# START OPEN WEBUI
+# START OPEN WEBUI (FIXED NETWORK)
 # =========================
 echo "📦 Starting Open WebUI..."
 
@@ -116,8 +114,5 @@ echo "✅ SYSTEM READY"
 echo "🌐 Open WebUI: http://localhost:$WEBUI_PORT"
 echo "📡 MCP API: http://127.0.0.1:$MCP_PORT"
 echo ""
-echo "✔ Debug MCP:"
-echo "   curl http://127.0.0.1:$MCP_PORT"
-echo ""
-echo "📄 Logs:"
-echo "   tail -f mcp.log"
+echo "✔ Test:"
+echo "   curl http://127.0.0.1:$MCP_PORT/v1/models"

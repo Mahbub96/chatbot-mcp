@@ -1,11 +1,20 @@
 import json
 import httpx
+import logging
 from config import MODEL, BASE_URL, get_nvidia_api_key
 
+logging.basicConfig(level=logging.INFO)
 
+
+# =========================
+# LLM CLIENT
+# =========================
 class LLMClient:
     def __init__(self):
         self.api_key = get_nvidia_api_key()
+
+        if not self.api_key:
+            raise RuntimeError("Missing NVIDIA API key")
 
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(60.0),
@@ -19,6 +28,9 @@ class LLMClient:
             },
         )
 
+    # =========================
+    # STREAMING CORE
+    # =========================
     async def stream(self, messages):
         payload = {
             "model": MODEL,
@@ -34,13 +46,21 @@ class LLMClient:
                 json=payload
             ) as res:
 
-                # handle API errors cleanly
+                # -------------------------
+                # API ERROR HANDLING
+                # -------------------------
                 if res.status_code != 200:
-                    text = await res.aread()
-                    yield f"[LLM_ERROR]: {text.decode()}"
+                    err = await res.aread()
+                    error_msg = f"[LLM_ERROR {res.status_code}] {err.decode()}"
+                    logging.error(error_msg)
+                    yield error_msg
                     return
 
+                # -------------------------
+                # STREAM PARSER
+                # -------------------------
                 async for line in res.aiter_lines():
+
                     if not line:
                         continue
 
@@ -54,25 +74,50 @@ class LLMClient:
 
                     try:
                         obj = json.loads(data)
-                        delta = obj["choices"][0].get("delta", {})
+
+                        delta = (
+                            obj.get("choices", [{}])[0]
+                            .get("delta", {})
+                        )
+
                         content = delta.get("content")
 
                         if content:
                             yield content
 
-                    except Exception:
+                    except json.JSONDecodeError:
                         continue
 
-        except Exception as e:
-            yield f"[LLM_EXCEPTION]: {str(e)}"
+                    except Exception as e:
+                        logging.warning(f"Stream parse error: {e}")
+                        continue
 
+        except httpx.RequestError as e:
+            error_msg = f"[NETWORK_ERROR] {str(e)}"
+            logging.error(error_msg)
+            yield error_msg
+
+        except Exception as e:
+            error_msg = f"[LLM_EXCEPTION] {str(e)}"
+            logging.error(error_msg)
+            yield error_msg
+
+    # =========================
+    # CLEANUP
+    # =========================
     async def close(self):
         await self.client.aclose()
 
 
-# Singleton (safe lazy init)
+# =========================
+# SINGLETON INSTANCE
+# =========================
 llm_client = LLMClient()
 
 
-def stream_llm(messages):
-    return llm_client.stream(messages)
+# =========================
+# PUBLIC STREAM API
+# =========================
+async def stream_llm(messages):
+    async for token in llm_client.stream(messages):
+        yield token
