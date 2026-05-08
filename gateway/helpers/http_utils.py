@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from config import HUMANIZE_RESPONSES, HUMAN_TONE_INSTRUCTION
+from gateway.memory_metrics import memory_metrics
 
 MODEL_NAME = "local-mcp-model"
 SYSTEM_PROMPT = (
@@ -65,22 +67,17 @@ def _normalized_scope(raw: Any) -> str:
         return ""
     # Keep scope tokens filesystem/sql friendly.
     safe = "".join(ch if (ch.isalnum() or ch in {"@", ".", "_", "-"}) else "_" for ch in value)
-    return safe[:128].strip("_")
+    normalized = safe[:128].strip("_")
+    if normalized:
+        return normalized
+    # Avoid silently collapsing malformed non-empty scopes into global.
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+    return f"invalid_scope_{digest}"
 
 
 def resolve_memory_scope(request: Request, body: dict[str, Any]) -> str:
-    body_scope = body.get("memory_scope")
-    normalized_body_scope = _normalized_scope(body_scope)
-    if normalized_body_scope:
-        return normalized_body_scope
-
-    # Explicit scope header has top priority after request body.
-    explicit_scope = _normalized_scope(request.headers.get("x-memory-scope"))
-    if explicit_scope:
-        return explicit_scope
-
-    # Permanent stable fallback from user identity headers.
-    # This keeps one user mapped to one scope automatically.
+    identity_scope = ""
+    identity_key = ""
     for key in (
         "x-user-email",
         "x-openwebui-user-email",
@@ -93,7 +90,58 @@ def resolve_memory_scope(request: Request, body: dict[str, Any]) -> str:
     ):
         candidate = _normalized_scope(request.headers.get(key))
         if candidate:
-            return candidate
+            identity_scope = candidate
+            identity_key = key
+            break
+
+    body_scope = body.get("memory_scope")
+    normalized_body_scope = _normalized_scope(body_scope)
+    if identity_scope and normalized_body_scope and normalized_body_scope != identity_scope:
+        memory_metrics.record_scope_resolution(
+            resolved_scope=identity_scope,
+            source="identity_override_body_scope",
+            source_key=identity_key,
+        )
+        return identity_scope
+    if normalized_body_scope and not identity_scope:
+        memory_metrics.record_scope_resolution(
+            resolved_scope=normalized_body_scope,
+            source="body",
+            source_key="memory_scope",
+        )
+        return normalized_body_scope
+
+    # Explicit scope header has top priority after request body.
+    explicit_scope = _normalized_scope(request.headers.get("x-memory-scope"))
+    if identity_scope and explicit_scope and explicit_scope != identity_scope:
+        memory_metrics.record_scope_resolution(
+            resolved_scope=identity_scope,
+            source="identity_override_header_scope",
+            source_key=identity_key,
+        )
+        return identity_scope
+    if explicit_scope and not identity_scope:
+        memory_metrics.record_scope_resolution(
+            resolved_scope=explicit_scope,
+            source="header",
+            source_key="x-memory-scope",
+        )
+        return explicit_scope
+
+    # Permanent stable fallback from user identity headers.
+    # This keeps one user mapped to one scope automatically.
+    if identity_scope:
+        memory_metrics.record_scope_resolution(
+            resolved_scope=identity_scope,
+            source="identity_header",
+            source_key=identity_key,
+        )
+        return identity_scope
+    memory_metrics.record_scope_resolution(
+        resolved_scope="global",
+        source="default",
+        source_key="none",
+    )
     return "global"
 
 

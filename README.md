@@ -83,6 +83,10 @@ Tooling:
 - **`MEMORY_AUTO_STORE`**: whether chat user turns are auto-stored.
 - **`MEMORY_MAX_ITEMS`**: cap per memory scope before pruning oldest records.
 - **`SHORT_TERM_TRACE_MAX_ITEMS`**: cap per scope for chat trace rows.
+- **`SHORT_TERM_RETENTION_HOURS`**: TTL window for short-term records before automatic cleanup.
+- **`SHORT_TERM_MAX_QUEUE_ITEMS`**: cap per scope for `short_memory_queue` rows.
+- **`SHORT_TERM_MAX_RETRIEVAL_LOG_ITEMS`**: cap per scope for `short_retrieval_logs` rows.
+- **`SHORT_TERM_CLEAR_ON_RESTART`**: clear all short-term memory tables at service boot.
 - **`MEMORY_QUEUE_BACKEND`**: memory async backend (`inprocess` or `rq`).
 - **`MEMORY_REDIS_URL`**: Redis connection URL used by RQ.
 - **`MEMORY_RQ_QUEUE`**: RQ queue name for memory jobs.

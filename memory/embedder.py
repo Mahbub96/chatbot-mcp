@@ -75,23 +75,32 @@ class NvidiaEmbeddingService:
                 pass
 
     def embed(self, text: str) -> list[float]:
-        normalized = (text or "").strip()
-        if not normalized:
-            return [0.0] * self.dim
-        cached = self._cache_get(normalized)
-        if cached is not None:
-            return cached
-        vec = self._embed_via_api(normalized)
-        if vec is None:
-            vec = self._fallback.embed(normalized)
-        self._cache_set(normalized, vec)
+        vec, _meta = self.embed_with_meta(text)
         return vec
 
-    def _embed_via_api(self, text: str) -> list[float] | None:
+    def embed_with_meta(self, text: str) -> tuple[list[float], dict[str, object]]:
+        normalized = (text or "").strip()
+        if not normalized:
+            return [0.0] * self.dim, {"provider": "empty", "reason": "empty_input"}
+        cached = self._cache_get(normalized)
+        if cached is not None:
+            return cached, {"provider": "cache", "reason": "cache_hit"}
+        vec, meta = self._embed_via_api(normalized)
+        if vec is None:
+            vec = self._fallback.embed(normalized)
+            fallback_reason = str(meta.get("reason") or "api_unavailable")
+            meta = {
+                "provider": "fallback",
+                "reason": fallback_reason,
+            }
+        self._cache_set(normalized, vec)
+        return vec, meta
+
+    def _embed_via_api(self, text: str) -> tuple[list[float] | None, dict[str, object]]:
         if self._disabled or self._client is None:
-            return None
+            return None, {"provider": "api", "reason": "disabled_no_api_key"}
         if self._disabled_until and time.time() < self._disabled_until:
-            return None
+            return None, {"provider": "api", "reason": "cooldown_active"}
         payload = {
             "model": EMBEDDING_MODEL,
             "input": text,
@@ -102,21 +111,21 @@ class NvidiaEmbeddingService:
             if res.status_code != 200:
                 if 400 <= res.status_code < 500:
                     self._disabled_until = time.time() + self._cooldown_seconds
-                return None
+                return None, {"provider": "api", "reason": f"http_{int(res.status_code)}", "status_code": int(res.status_code)}
             obj = res.json()
             data = obj.get("data")
             if not isinstance(data, list) or not data:
-                return None
+                return None, {"provider": "api", "reason": "invalid_response_data"}
             embedding = data[0].get("embedding")
             if not isinstance(embedding, list) or not embedding:
-                return None
+                return None, {"provider": "api", "reason": "invalid_response_embedding"}
             vec = [float(x) for x in embedding]
             if len(vec) != self.dim:
                 vec = self._fit_dim(vec)
-            return self._normalize(vec)
+            return self._normalize(vec), {"provider": "api", "reason": "ok", "status_code": 200}
         except Exception:
             self._disabled_until = time.time() + self._cooldown_seconds
-            return None
+            return None, {"provider": "api", "reason": "exception"}
 
     def _fit_dim(self, vec: list[float]) -> list[float]:
         if len(vec) == self.dim:

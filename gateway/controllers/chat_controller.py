@@ -19,6 +19,7 @@ from config import (
     MODEL as DEFAULT_UPSTREAM_MODEL,
     RATE_LIMIT_MAX_REQUESTS,
     RATE_LIMIT_WINDOW_SECONDS,
+    SHADOW_MONITOR_ENABLED,
     VISION_STREAM_TIMEOUT_SECONDS,
     VISION_MODEL,
 )
@@ -62,6 +63,7 @@ from gateway.helpers.memory_logic import (
 )
 from gateway.helpers.rate_limiter import InMemoryRateLimiter
 from gateway.memory_pipeline import memory_pipeline
+from gateway.memory_metrics import memory_metrics
 from memory.facade import memory_facade as memory_service
 from router.model_router import pick_upstream_model
 from router.tool_router import maybe_run_legacy_keyword_tool
@@ -155,6 +157,35 @@ def looks_like_missing_personal_info_reply(text: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def infer_retrieval_method(retrieved_items: list[dict[str, Any]]) -> str:
+    if not retrieved_items:
+        return "structured"
+    sources = {str(item.get("source") or "").strip().lower() for item in retrieved_items}
+    has_short = bool({"short_trace", "short_trace_context"}.intersection(sources))
+    has_long = "long_term_attribute" in sources
+    has_vectorish = bool(
+        {
+            "chat_user",
+            "chat_assistant",
+            "profile_fact",
+            "profile_full",
+            "manual",
+        }.intersection(sources)
+    )
+    has_lexical = "lexical" in sources
+    if has_short or has_long:
+        if has_vectorish or has_lexical:
+            return "hybrid"
+        return "structured"
+    if has_lexical and has_vectorish:
+        return "hybrid"
+    if has_lexical:
+        return "fts"
+    if has_vectorish:
+        return "vector"
+    return "fts"
+
+
 def resolve_local_personal_fallback(
     *,
     user_text: str,
@@ -165,11 +196,15 @@ def resolve_local_personal_fallback(
     if fallback:
         return fallback
     pools: list[list[dict[str, Any]]] = []
+    # 1) Current-scope short-term first (most recent conversational truth)
+    pools.append(memory_service.list_short_term_slot_facts(query=user_text, memory_scope=memory_scope, limit=50))
+    pools.append(memory_service.list_short_term_context_facts(query=user_text, memory_scope=memory_scope, limit=60))
+    # 2) Current-scope long/profile views
     pools.append(memory_service.list_profile_facts(memory_scope=memory_scope, limit=50))
     pools.append(memory_service.list_profile_memories(memory_scope=memory_scope, limit=50))
-    if memory_scope != "global":
-        pools.append(memory_service.list_profile_facts(memory_scope="global", limit=50))
-        pools.append(memory_service.list_profile_memories(memory_scope="global", limit=50))
+    # Cross-tab safety net: opt-in via config for production control.
+    pools.append(memory_service.list_short_term_slot_facts_any_scope(query=user_text, limit=80))
+    pools.append(memory_service.list_short_term_context_facts_any_scope(query=user_text, limit=120))
     pools.append(memory_service.list_profile_facts_any_scope(limit=80))
     pools.append(memory_service.list_profile_memories_any_scope(limit=120))
     for pool in pools:
@@ -193,6 +228,43 @@ def persist_user_memory_on_failure(*, user_text: str, memory_scope: str) -> None
     except Exception:
         # Best-effort resilience path for upstream failures.
         return
+
+
+async def persist_turn_memory(
+    *,
+    user_text: str,
+    assistant_text: str,
+    memory_scope: str,
+) -> None:
+    if not MEMORY_ENABLED:
+        return
+    normalized_user = (user_text or "").strip()
+    normalized_assistant = (assistant_text or "").strip()
+    if not normalized_user and not normalized_assistant:
+        return
+    # Read-your-write consistency: for personal-memory turns, persist inline
+    # so immediate cross-thread requests can retrieve the latest facts.
+    if normalized_user and is_personal_memory_query(normalized_user):
+        try:
+            await asyncio.to_thread(
+                memory_service.maybe_store_from_user_turn,
+                text=normalized_user,
+                memory_scope=memory_scope,
+            )
+            await asyncio.to_thread(
+                memory_service.maybe_store_from_assistant_turn,
+                text=normalized_assistant,
+                memory_scope=memory_scope,
+            )
+            return
+        except Exception:
+            # Fallback to queue path without breaking response.
+            pass
+    memory_pipeline.enqueue(
+        memory_scope=memory_scope,
+        user_text=normalized_user,
+        assistant_text=normalized_assistant,
+    )
 
 
 def normalize_chat_error(exc: Exception, *, had_image_input: bool, model: str) -> str:
@@ -282,22 +354,74 @@ async def handle_chat_completions(request: Request) -> Any:
 
     if MEMORY_ENABLED and user_text:
         try:
-            memories = memory_service.retrieve_memory(query=user_text, memory_scope=memory_scope, limit=10)
+            memories = await asyncio.to_thread(
+                memory_service.retrieve_memory,
+                query=user_text,
+                memory_scope=memory_scope,
+                limit=10,
+            )
             retrieval_trace_items = memories[:]
-            memory_service.log_retrieval_decision(
+            if SHADOW_MONITOR_ENABLED:
+                try:
+                    legacy_shadow = await asyncio.to_thread(
+                        memory_service.search_legacy_only,
+                        query=user_text,
+                        memory_scope=memory_scope,
+                        limit=10,
+                    )
+                    memory_metrics.record_shadow_comparison(
+                        memory_scope=memory_scope,
+                        prod_items=memories,
+                        shadow_items=legacy_shadow,
+                    )
+                except Exception:
+                    logger.debug("shadow_monitor_compare_failed", exc_info=True)
+            retrieval_method = infer_retrieval_method(retrieval_trace_items)
+            await asyncio.to_thread(
+                memory_service.log_retrieval_decision,
                 trace_id=request_id,
                 memory_scope=memory_scope,
                 query_text=user_text,
                 retrieved_items=retrieval_trace_items,
-                method_used="vector",
+                method_used=retrieval_method,
             )
             query_matched_memories = matched_memories_for_query(user_text, select_context_memories(user_text, memories))
-            if not query_matched_memories and detect_fact_slots(user_text).intersection({"name", "university", "email"}):
-                trusted = memory_service.list_profile_facts(memory_scope=memory_scope, limit=20) or memory_service.list_profile_facts(memory_scope="global", limit=20)
+            if not query_matched_memories and detect_fact_slots(user_text):
+                trusted = await asyncio.to_thread(
+                    memory_service.list_long_term_slot_facts,
+                    query=user_text,
+                    memory_scope=memory_scope,
+                    limit=20,
+                )
+                if not trusted:
+                    trusted = await asyncio.to_thread(
+                        memory_service.list_profile_facts,
+                        memory_scope=memory_scope,
+                        limit=20,
+                    )
                 query_matched_memories = matched_memories_for_query(user_text, trusted)
+            if not query_matched_memories and is_personal_memory_query(user_text):
+                cross_tab_short = (
+                    await asyncio.to_thread(
+                        memory_service.list_short_term_slot_facts_any_scope,
+                        query=user_text,
+                        limit=40,
+                    )
+                    + await asyncio.to_thread(
+                        memory_service.list_short_term_context_facts_any_scope,
+                        query=user_text,
+                        limit=60,
+                    )
+                )
+                if cross_tab_short:
+                    query_matched_memories = matched_memories_for_query(
+                        user_text,
+                        select_context_memories(user_text, cross_tab_short),
+                    )
             llm_messages = inject_memory_context(messages, query_matched_memories)
         except Exception as exc:
-            memory_service.log_retrieval_decision(
+            await asyncio.to_thread(
+                memory_service.log_retrieval_decision,
                 trace_id=request_id,
                 memory_scope=memory_scope,
                 query_text=user_text,
@@ -341,13 +465,53 @@ async def handle_chat_completions(request: Request) -> Any:
 
     if MEMORY_ENABLED and user_text and looks_like_structured_document_text(user_text) and not has_multimodal(llm_messages):
         stored_ok = False
+        store_bool_result = False
+        evidence_profile_full = False
+        evidence_profile_memories = False
+        evidence_profile_facts = False
         try:
-            memory_service.maybe_store_from_user_turn(text=user_text, memory_scope=memory_scope)
-            # Confirm persistence before claiming success.
-            stored_ok = bool(
-                memory_service.latest_profile_full(memory_scope=memory_scope)
-                or memory_service.latest_profile_full(memory_scope="global")
-                or memory_service.latest_profile_full_any_scope()
+            store_bool_result = bool(
+                await asyncio.to_thread(
+                    memory_service.maybe_store_from_user_turn,
+                    text=user_text,
+                    memory_scope=memory_scope,
+                )
+            )
+            stored_ok = store_bool_result
+            # Safety net for compatibility paths where write might succeed but bool path is unavailable.
+            if not stored_ok:
+                evidence_profile_full = bool(
+                    await asyncio.to_thread(memory_service.latest_profile_full, memory_scope=memory_scope)
+                )
+                evidence_profile_memories = bool(
+                    await asyncio.to_thread(
+                        memory_service.list_profile_memories,
+                        memory_scope=memory_scope,
+                        limit=1,
+                    )
+                )
+                evidence_profile_facts = bool(
+                    await asyncio.to_thread(
+                        memory_service.list_profile_facts,
+                        memory_scope=memory_scope,
+                        limit=1,
+                    )
+                )
+                stored_ok = bool(
+                    evidence_profile_full
+                    or evidence_profile_memories
+                    or evidence_profile_facts
+                )
+            logger.info(
+                "structured_ingest_decision request_id=%s scope=%s text_len=%s store_bool=%s evidence_profile_full=%s evidence_profile_memories=%s evidence_profile_facts=%s final_stored_ok=%s",
+                request_id,
+                memory_scope,
+                len(user_text or ""),
+                store_bool_result,
+                evidence_profile_full,
+                evidence_profile_memories,
+                evidence_profile_facts,
+                stored_ok,
             )
         except Exception as exc:
             logger.warning("Structured document memory write failed: %s", exc)
@@ -370,7 +534,21 @@ async def handle_chat_completions(request: Request) -> Any:
 
         return StreamingResponse(ingest_ack_stream(), media_type="text/event-stream")
     if MEMORY_ENABLED and user_text and is_user_profile_summary_query(user_text) and not has_multimodal(llm_messages):
-        return build_non_stream_response(tool_prefix + build_user_profile_summary(memory_service.list_profile_memories_any_scope(limit=300)))
+        local_memories = memory_service.list_profile_memories(memory_scope=memory_scope, limit=220)
+        if len(local_memories) < 8:
+            any_scope = memory_service.list_profile_memories_any_scope(limit=320)
+            seen: set[str] = set()
+            merged: list[dict[str, Any]] = []
+            for item in (local_memories + any_scope):
+                sig = f"{str(item.get('memory_scope') or '')}|{str(item.get('source') or '')}|{str(item.get('text') or '').strip().lower()}"
+                if not sig or sig in seen:
+                    continue
+                seen.add(sig)
+                merged.append(item)
+                if len(merged) >= 300:
+                    break
+            local_memories = merged
+        return build_non_stream_response(tool_prefix + build_user_profile_summary(local_memories))
     if MEMORY_ENABLED and user_text and is_exact_shared_request(user_text) and not has_multimodal(llm_messages):
         best = pick_best_shared_memory(memory_service.list_profile_memories_any_scope(limit=400))
         return build_non_stream_response(tool_prefix + (build_exact_shared_response(best) if best else "I couldn't find an exact shared item in local memory."))
@@ -379,17 +557,39 @@ async def handle_chat_completions(request: Request) -> Any:
     if user_text and is_offer_intent_query(user_text) and not has_multimodal(llm_messages):
         return build_non_stream_response(tool_prefix + build_offer_intent_answer())
 
-    memory_missing_answer = None
-    if MEMORY_ENABLED and user_text and not query_matched_memories and not has_multimodal(llm_messages) and not looks_like_structured_document_text(user_text):
-        memory_missing_answer = build_memory_missing_answer(user_text)
     if MEMORY_ENABLED and user_text and is_cv_query(user_text) and not has_multimodal(llm_messages):
         if is_exact_cv_request(user_text):
-            cv_full = memory_service.latest_profile_full(memory_scope=memory_scope) or memory_service.latest_profile_full(memory_scope="global") or memory_service.latest_profile_full_any_scope()
+            cv_full = memory_service.latest_profile_full(memory_scope=memory_scope)
+            if not cv_full:
+                cv_full = memory_service.latest_profile_full_any_scope()
             if cv_full and (cv_full.get("text") or "").strip():
                 return build_non_stream_response(tool_prefix + build_exact_cv_response(str(cv_full.get("text") or "")))
-        richer = memory_service.list_profile_memories(memory_scope=memory_scope, limit=8) or memory_service.list_profile_memories(memory_scope="global", limit=8) or memory_service.list_profile_facts_any_scope(limit=8)
-        cv_context = build_cv_context_answer(richer or query_matched_memories)
-        if cv_context: memory_missing_answer = cv_context
+        richer = memory_service.list_profile_memories(memory_scope=memory_scope, limit=8)
+        if len(richer) < 4:
+            richer = memory_service.list_profile_memories_any_scope(limit=16)
+        _ = build_cv_context_answer(richer or query_matched_memories)
+
+    if (
+        MEMORY_ENABLED
+        and user_text
+        and is_personal_memory_query(user_text)
+        and not query_matched_memories
+        and not has_multimodal(llm_messages)
+    ):
+        missing_answer = build_memory_missing_answer(user_text)
+        if missing_answer:
+            if not stream:
+                return build_non_stream_response(tool_prefix + missing_answer)
+
+            async def missing_memory_stream():
+                yield ":\n\n"
+                if tool_prefix:
+                    yield sse_data(build_chunk_payload(chunk_id="tool", delta_content=tool_prefix))
+                yield sse_data(build_chunk_payload(chunk_id="memory-missing", delta_content=missing_answer))
+                yield sse_data(build_chunk_payload(chunk_id="memory-missing", finish_reason="stop"))
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(missing_memory_stream(), media_type="text/event-stream")
 
     if not stream:
         try:
@@ -419,6 +619,7 @@ async def handle_chat_completions(request: Request) -> Any:
                     memories=query_matched_memories,
                 )
             ):
+                memory_metrics.record_wrong_answer_guard_trigger(memory_scope=memory_scope)
                 safe_fallback = resolve_local_personal_fallback(
                     user_text=user_text,
                     memory_scope=memory_scope,
@@ -427,10 +628,10 @@ async def handle_chat_completions(request: Request) -> Any:
                 if safe_fallback:
                     text = safe_fallback
             if MEMORY_ENABLED and user_text:
-                memory_pipeline.enqueue(
-                    memory_scope=memory_scope,
+                await persist_turn_memory(
                     user_text=user_text,
                     assistant_text=text,
+                    memory_scope=memory_scope,
                 )
                 memory_service.log_chat_trace(
                     request_id=request_id,
@@ -512,10 +713,10 @@ async def handle_chat_completions(request: Request) -> Any:
                 if vision_text:
                     yield sse_data(build_chunk_payload(chunk_id="chatcmpl-local", delta_content=vision_text))
                 if MEMORY_ENABLED and user_text and vision_text:
-                    memory_pipeline.enqueue(
-                        memory_scope=memory_scope,
+                    await persist_turn_memory(
                         user_text=user_text,
                         assistant_text=vision_text,
+                        memory_scope=memory_scope,
                     )
                     memory_service.log_chat_trace(
                         request_id=request_id,
@@ -597,6 +798,7 @@ async def handle_chat_completions(request: Request) -> Any:
                 memories=query_matched_memories,
             )
         ):
+            memory_metrics.record_wrong_answer_guard_trigger(memory_scope=memory_scope)
             safe_fallback = resolve_local_personal_fallback(
                 user_text=user_text,
                 memory_scope=memory_scope,
@@ -613,10 +815,10 @@ async def handle_chat_completions(request: Request) -> Any:
                 final_text = build_image_refusal_diagnostic(upstream_model)
             yield sse_data(build_chunk_payload(chunk_id="chatcmpl-local", delta_content=final_text))
         if MEMORY_ENABLED and user_text and collected_tokens:
-            memory_pipeline.enqueue(
-                memory_scope=memory_scope,
+            await persist_turn_memory(
                 user_text=user_text,
                 assistant_text=final_text,
+                memory_scope=memory_scope,
             )
             memory_service.log_chat_trace(
                 request_id=request_id,

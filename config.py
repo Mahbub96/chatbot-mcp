@@ -44,15 +44,24 @@ MEMORY_MIN_SCORE = float(os.getenv("MEMORY_MIN_SCORE") or "0.20")
 MEMORY_AUTO_STORE = (os.getenv("MEMORY_AUTO_STORE") or "true").strip().lower() in {"1", "true", "yes", "on"}
 MEMORY_MAX_ITEMS = int(os.getenv("MEMORY_MAX_ITEMS") or "5000")
 SHORT_TERM_TRACE_MAX_ITEMS = int(os.getenv("SHORT_TERM_TRACE_MAX_ITEMS") or "20000")
+SHORT_TERM_RETENTION_HOURS = max(1, int(os.getenv("SHORT_TERM_RETENTION_HOURS") or "24"))
+SHORT_TERM_MAX_QUEUE_ITEMS = max(100, int(os.getenv("SHORT_TERM_MAX_QUEUE_ITEMS") or "25000"))
+SHORT_TERM_MAX_RETRIEVAL_LOG_ITEMS = max(100, int(os.getenv("SHORT_TERM_MAX_RETRIEVAL_LOG_ITEMS") or "25000"))
+SHORT_TERM_CLEAR_ON_RESTART = (os.getenv("SHORT_TERM_CLEAR_ON_RESTART") or "true").strip().lower() in {"1", "true", "yes", "on"}
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS") or "100")
 RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS") or "100")
 LOG_JSON = (os.getenv("LOG_JSON") or "true").strip().lower() in {"1", "true", "yes", "on"}
+DEBUG_MODE = (os.getenv("DEBUG_MODE") or "false").strip().lower() in {"1", "true", "yes", "on"}
 VISION_STREAM_TIMEOUT_SECONDS = int(os.getenv("VISION_STREAM_TIMEOUT_SECONDS") or "90")
 HUMANIZE_RESPONSES = (os.getenv("HUMANIZE_RESPONSES") or "true").strip().lower() in {"1", "true", "yes", "on"}
 HUMAN_TONE_INSTRUCTION = (
     os.getenv("HUMAN_TONE_INSTRUCTION")
     or "Respond in a natural, warm, and human tone. Be clear, concise, and conversational."
 )
+SHADOW_MONITOR_ENABLED = (os.getenv("SHADOW_MONITOR_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
+LEGACY_READ_FALLBACK_ENABLED = (os.getenv("LEGACY_READ_FALLBACK_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
+LEGACY_WRITE_ENABLED = (os.getenv("LEGACY_WRITE_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
+PROFILE_ANY_SCOPE_FALLBACK_ENABLED = (os.getenv("PROFILE_ANY_SCOPE_FALLBACK_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def get_nvidia_api_key():

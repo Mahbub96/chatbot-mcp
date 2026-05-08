@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import logging
 import os
+import re
 
 from sqlalchemy import create_engine
 from sqlalchemy import text as sql_text
 from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
-from config import MEMORY_SQLITE_URL
+from config import DEBUG_MODE, MEMORY_SQLITE_URL
 from memory.models import Base
 
 SQLITE_URL_PREFIX = "sqlite:///"
 MEMORY_RECORDS_TABLE_INFO_SQL = "PRAGMA table_info(memory_records)"
+AUDIT_TABLE_PREFIXES = ("short_", "long_")
+AUDIT_TABLE_REGEX = re.compile(r"\b(?:FROM|JOIN|INTO|UPDATE)\s+([A-Za-z_]\w*)", re.IGNORECASE)
+audit_logger = logging.getLogger("memory.db.audit")
 
 
 def create_engine_and_session():
@@ -22,7 +28,12 @@ def create_engine_and_session():
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
 
-    engine = create_engine(MEMORY_SQLITE_URL, future=True)
+    engine_kwargs: dict[str, object] = {"future": True}
+    if MEMORY_SQLITE_URL.startswith(SQLITE_URL_PREFIX):
+        # Avoid long-lived pooled SQLite connections holding stale file handles
+        # when DB files are replaced/reset during runtime.
+        engine_kwargs["poolclass"] = NullPool
+    engine = create_engine(MEMORY_SQLITE_URL, **engine_kwargs)
     if MEMORY_SQLITE_URL.startswith(SQLITE_URL_PREFIX):
         @event.listens_for(engine, "connect")
         def _set_sqlite_pragmas(dbapi_connection, _connection_record):
@@ -31,7 +42,49 @@ def create_engine_and_session():
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA temp_store=MEMORY")
             cursor.execute("PRAGMA cache_size=-20000")
+            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA wal_autocheckpoint=1000")
+            cursor.execute("PRAGMA mmap_size=30000000000")
             cursor.close()
+
+        @event.listens_for(engine, "before_cursor_execute")
+        def _audit_sqlite_memory_queries(_conn, _cursor, statement, _parameters, _context, _executemany):
+            if not DEBUG_MODE:
+                return
+            sql = " ".join((statement or "").strip().split())
+            if not sql:
+                return
+            lowered = sql.lower()
+            if lowered.startswith("select"):
+                op = "find"
+            elif lowered.startswith("insert"):
+                op = "create"
+            elif lowered.startswith("update"):
+                op = "update"
+            elif lowered.startswith("delete"):
+                op = "delete"
+            else:
+                return
+
+            seen: set[str] = set()
+            for table in AUDIT_TABLE_REGEX.findall(sql):
+                normalized = (table or "").strip().lower()
+                if (
+                    not normalized
+                    or not normalized.startswith(AUDIT_TABLE_PREFIXES)
+                    or normalized in seen
+                ):
+                    continue
+                seen.add(normalized)
+                if op == "find":
+                    audit_logger.info("Finding from %s table", normalized)
+                elif op == "create":
+                    audit_logger.info("Creating in %s table", normalized)
+                elif op == "update":
+                    audit_logger.info("Updating %s table", normalized)
+                elif op == "delete":
+                    audit_logger.info("Deleting from %s table", normalized)
     SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
     try:
         Base.metadata.create_all(engine)
@@ -264,6 +317,33 @@ def _ensure_short_long_memory_schema(engine) -> None:
         conn.execute(
             sql_text(
                 """
+                CREATE TABLE IF NOT EXISTS short_runtime_metrics (
+                    memory_scope TEXT NOT NULL DEFAULT 'global',
+                    metric_key TEXT NOT NULL,
+                    metric_value INTEGER NOT NULL DEFAULT 0
+                        CHECK (metric_value >= 0),
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (memory_scope, metric_key)
+                )
+                """
+            )
+        )
+        conn.execute(
+            sql_text(
+                """
+                CREATE TABLE IF NOT EXISTS short_scope_resolution_events (
+                    id TEXT PRIMARY KEY,
+                    memory_scope TEXT NOT NULL DEFAULT 'global',
+                    source TEXT NOT NULL,
+                    source_key TEXT NOT NULL DEFAULT '',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            sql_text(
+                """
                 CREATE TABLE IF NOT EXISTS long_entities (
                     id TEXT PRIMARY KEY,
                     memory_scope TEXT NOT NULL DEFAULT 'global',
@@ -363,6 +443,8 @@ def _ensure_short_long_memory_schema(engine) -> None:
         conn.execute(sql_text("CREATE INDEX IF NOT EXISTS ix_short_memory_queue_status_created ON short_memory_queue(extraction_status, created_at)"))
         conn.execute(sql_text("CREATE INDEX IF NOT EXISTS ix_short_memory_queue_scope_status_created ON short_memory_queue(memory_scope, extraction_status, created_at)"))
         conn.execute(sql_text("CREATE INDEX IF NOT EXISTS ix_short_memory_queue_fingerprint ON short_memory_queue(dedupe_fingerprint)"))
+        conn.execute(sql_text("CREATE INDEX IF NOT EXISTS ix_short_runtime_metrics_scope_key ON short_runtime_metrics(memory_scope, metric_key)"))
+        conn.execute(sql_text("CREATE INDEX IF NOT EXISTS ix_short_scope_resolution_events_scope_created ON short_scope_resolution_events(memory_scope, created_at DESC)"))
         conn.execute(sql_text("CREATE INDEX IF NOT EXISTS ix_long_entities_scope_type ON long_entities(memory_scope, entity_type)"))
         conn.execute(sql_text("CREATE INDEX IF NOT EXISTS ix_long_entities_scope_name ON long_entities(memory_scope, canonical_name)"))
         conn.execute(sql_text("CREATE INDEX IF NOT EXISTS ix_long_entities_confidence_importance ON long_entities(confidence_score DESC, importance_score DESC)"))

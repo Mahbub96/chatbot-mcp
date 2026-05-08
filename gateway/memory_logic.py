@@ -18,12 +18,30 @@ def select_context_memories(user_text: str, memories: list[dict[str, Any]]) -> l
         if normalized_query and text.lower() == normalized_query:
             continue
         source = (item.get("source") or "").strip().lower()
+        structured = item.get("structured_data") if isinstance(item.get("structured_data"), dict) else {}
+        source_field = str(structured.get("source_field") or "").strip().lower()
         if source == "chat_assistant":
             if len(text) > 500:
                 continue
             if text.startswith("I ") and ("don't have" in text.lower() or "couldn't find" in text.lower()):
                 continue
             if float(item.get("importance") or 0.0) < 0.4:
+                continue
+        if source == "short_trace_context" and source_field == "assistant_response":
+            lowered = text.lower()
+            # Do not recycle assistant fallback/uncertainty text as factual memory evidence.
+            if any(
+                marker in lowered
+                for marker in (
+                    "no marker set",
+                    "i don't have",
+                    "i do not have",
+                    "couldn't find",
+                    "not sure",
+                    "not fully verified",
+                    "possible memory",
+                )
+            ):
                 continue
         if has_question_like_shape(text):
             continue
@@ -74,6 +92,8 @@ def text_token_overlap(a: str, b: str) -> float:
 def detect_fact_slots(text: str) -> set[str]:
     t = (text or "").lower()
     slots: set[str] = set()
+    if any(k in t for k in ("information about", "info about", "tell me about", "who is ")):
+        slots.add("name")
     if any(k in t for k in ("university", "varsity", "বিশ্ববিদ্যাল", "univ")):
         slots.add("university")
     if any(k in t for k in ("name", "nam", "নাম")):
@@ -86,6 +106,8 @@ def detect_fact_slots(text: str) -> set[str]:
         slots.add("cv")
     if any(k in t for k in ("email", "mail", "ইমেইল")):
         slots.add("email")
+    if any(k in t for k in ("marker", "code", "pin", "otp", "token", "id")):
+        slots.add("code")
     if any(
         k in t
         for k in (
@@ -315,6 +337,18 @@ def build_user_profile_summary(memories: list[dict[str, Any]]) -> str:
         "summary",
         "objective",
         "website",
+        "role",
+        "company",
+        "team",
+        "home district",
+        "home_district",
+        "interests",
+        "goals",
+        "projects",
+        "learning",
+        "work style",
+        "work_style",
+        "preferences",
     }
     core_keys = {
         "name",
@@ -345,6 +379,14 @@ def build_user_profile_summary(memories: list[dict[str, Any]]) -> str:
         value = value.strip()
         if key not in allowed_keys or not value:
             continue
+        if key in {"name", "full name"}:
+            lowered_value = value.lower()
+            # Prevent noisy non-name values from polluting name conflicts.
+            if any(
+                token in lowered_value
+                for token in ("engineer", "developer", "ltd", "technologies", "company", "dhaka", "role")
+            ):
+                continue
         score = source_priority(source)
         importance = float(item.get("importance") or 0.0)
         by_key.setdefault(key, []).append((value, score, importance))
@@ -357,14 +399,26 @@ def build_user_profile_summary(memories: list[dict[str, Any]]) -> str:
     keys_in_order = [
         "name",
         "full name",
+        "role",
+        "company",
+        "team",
         "email",
         "phone",
         "mobile",
         "location",
+        "home district",
+        "home_district",
         "education",
         "university",
         "experience",
         "skills",
+        "interests",
+        "goals",
+        "projects",
+        "learning",
+        "work style",
+        "work_style",
+        "preferences",
         "website",
     ]
     for key in keys_in_order:
@@ -456,6 +510,8 @@ def matched_memories_for_query(query_text: str, memories: list[dict[str, Any]]) 
         if not text:
             continue
         src = (item.get("source") or "").strip().lower()
+        if src != "profile_fact" and is_low_quality_memory_text(text):
+            continue
         if is_cv_query(query) and src == "profile_fact":
             matched.append(item)
             continue
@@ -490,6 +546,42 @@ def build_memory_fallback_answer(user_text: str, memories: list[dict[str, Any]])
     if not memories:
         return None
     query_slots = detect_fact_slots(user_text)
+    query_role = ""
+    query_company = ""
+    if "work" in query_slots:
+        for item in memories:
+            top_text = (item.get("text") or "").strip()
+            source = (item.get("source") or "").strip().lower()
+            confidence = float(item.get("confidence") or 0.0)
+            if confidence < MIN_MEMORY_FACT_CONFIDENCE:
+                continue
+            if not top_text or is_low_quality_memory_text(top_text) or has_question_like_shape(top_text):
+                continue
+            if source == "profile_full":
+                extracted = extract_profile_full_slot_fact(user_text, top_text)
+                if not extracted:
+                    continue
+                top_text = extracted
+            if ":" not in top_text:
+                continue
+            key, value = top_text.split(":", 1)
+            k = key.strip().lower()
+            v = value.strip()
+            if not v:
+                continue
+            if k in {"role", "profession", "occupation"} and not query_role:
+                query_role = v
+            elif k == "company" and not query_company:
+                query_company = v
+            if query_role and query_company:
+                break
+        if query_role and query_company:
+            return f"Saved facts: role: {query_role}; company: {query_company}"
+        if query_role:
+            return f"Saved fact: role: {query_role}"
+        if query_company:
+            return f"Saved fact: company: {query_company}"
+
     for item in memories:
         top_text = (item.get("text") or "").strip()
         source = (item.get("source") or "").strip().lower()
@@ -497,6 +589,8 @@ def build_memory_fallback_answer(user_text: str, memories: list[dict[str, Any]])
         if confidence < MIN_MEMORY_FACT_CONFIDENCE:
             continue
         if not top_text or is_low_quality_memory_text(top_text) or has_question_like_shape(top_text):
+            continue
+        if not query_slots and text_token_overlap(user_text, top_text) < 0.2:
             continue
         if not has_slot_match(user_text, top_text):
             continue
@@ -640,6 +734,14 @@ def is_personal_memory_query(text: str) -> bool:
     t = (text or "").strip().lower()
     if not t:
         return False
+    profile_lookup_intents = (
+        "information about",
+        "info about",
+        "tell me about",
+        "who is ",
+    )
+    if any(intent in t for intent in profile_lookup_intents):
+        return True
     personal_signals = (
         "my ",
         "amar ",

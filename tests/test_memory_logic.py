@@ -61,6 +61,12 @@ class MemoryLogicTest(unittest.TestCase):
     def test_work_query_is_personal_memory_query(self):
         self.assertTrue(is_personal_memory_query("where I work ?"))
 
+    def test_information_about_query_is_personal_memory_query(self):
+        self.assertTrue(is_personal_memory_query("I need information about mahbub alam"))
+
+    def test_information_about_query_maps_to_name_slot(self):
+        self.assertIn("name", detect_fact_slots("tell me about mahbub alam"))
+
 
 if __name__ == "__main__":
     unittest.main()
