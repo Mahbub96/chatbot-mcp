@@ -11,3 +11,8 @@ router = APIRouter()
 async def chat_completions(request: Request):
     return await handle_chat_completions(request)
 
+
+@router.post("/chat")
+async def chat_alias(request: Request):
+    return await handle_chat_completions(request)
+

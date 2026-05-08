@@ -1,15 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
+import uuid
+from urllib.parse import urlparse
 from typing import Any
 
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
 from agent.llm import complete_llm, stream_llm
-from config import BANGLA_MODEL, CODE_MODEL, MEMORY_ENABLED, MODEL as DEFAULT_UPSTREAM_MODEL, VISION_MODEL
+from config import (
+    BANGLA_MODEL,
+    CODE_MODEL,
+    MEMORY_ENABLED,
+    MODEL as DEFAULT_UPSTREAM_MODEL,
+    RATE_LIMIT_MAX_REQUESTS,
+    RATE_LIMIT_WINDOW_SECONDS,
+    VISION_STREAM_TIMEOUT_SECONDS,
+    VISION_MODEL,
+)
 from gateway.controllers.tool_controller import execute_tool_with_policy
 from gateway.helpers.http_utils import (
     build_chunk_payload,
@@ -45,10 +57,12 @@ from gateway.helpers.memory_logic import (
     matched_memories_for_query,
     pick_best_shared_memory,
     select_context_memories,
+    should_reject_personal_answer,
     user_disputes_identity,
 )
 from gateway.helpers.rate_limiter import InMemoryRateLimiter
-from memory import memory_service
+from gateway.memory_pipeline import memory_pipeline
+from memory.facade import memory_facade as memory_service
 from router.model_router import pick_upstream_model
 from router.tool_router import maybe_run_legacy_keyword_tool
 
@@ -59,7 +73,10 @@ ERR_INVALID_JSON_BODY = "Invalid JSON body"
 ERR_BODY_OBJECT_REQUIRED = "Request body must be an object"
 TOOL_TEST_FILE_PATH = "test.txt"
 
-rate_limiter = InMemoryRateLimiter(window_seconds=100, max_requests=100)
+rate_limiter = InMemoryRateLimiter(
+    window_seconds=max(1, RATE_LIMIT_WINDOW_SECONDS),
+    max_requests=max(1, RATE_LIMIT_MAX_REQUESTS),
+)
 BANGLA_MODEL_COOLDOWN_SECONDS = 300
 FAST_BANGLA_FALLBACK_MODEL = "meta/llama-3.1-8b-instruct"
 _model_unavailable_until: dict[str, float] = {}
@@ -86,6 +103,32 @@ def build_image_refusal_diagnostic(model: str) -> str:
     )
 
 
+def find_unsupported_image_input(messages: list[dict[str, Any]]) -> str | None:
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            image_obj = part.get("image_url") or {}
+            if not isinstance(image_obj, dict):
+                continue
+            image_url = str(image_obj.get("url") or "").strip()
+            if not image_url:
+                continue
+            lowered = image_url.lower()
+            if lowered.startswith("data:image/"):
+                return "inline-base64"
+            parsed = urlparse(image_url)
+            host = (parsed.hostname or "").lower()
+            if host in {"localhost", "127.0.0.1", "0.0.0.0"} or host.startswith("192.168.") or host.startswith("10.") or host.endswith(".local"):
+                return "private-url"
+    return None
+
+
 def is_upstream_error_token(token: str) -> bool:
     text = (token or "").strip()
     return text.startswith("[LLM_ERROR") or text.startswith("[NETWORK_ERROR]") or text.startswith("[LLM_EXCEPTION]")
@@ -98,12 +141,16 @@ def looks_like_missing_personal_info_reply(text: str) -> bool:
     markers = (
         "i don't have that information",
         "i don't have information about",
+        "i don't have any information about",
+        "i don't have any specific information about",
         "you haven't shared",
         "i don't know your",
         "i do not know your",
         "i'm not aware of your",
         "i am not aware of your",
         "i'm not sure about your",
+        "i'm assuming",
+        "i am assuming",
     )
     return any(marker in lowered for marker in markers)
 
@@ -133,6 +180,19 @@ def resolve_local_personal_fallback(
         if fallback:
             return fallback
     return None
+
+
+def persist_user_memory_on_failure(*, user_text: str, memory_scope: str) -> None:
+    if not MEMORY_ENABLED:
+        return
+    normalized = (user_text or "").strip()
+    if not normalized:
+        return
+    try:
+        memory_service.maybe_store_from_user_turn(text=normalized, memory_scope=memory_scope)
+    except Exception:
+        # Best-effort resilience path for upstream failures.
+        return
 
 
 def normalize_chat_error(exc: Exception, *, had_image_input: bool, model: str) -> str:
@@ -192,6 +252,7 @@ def bangla_fallback_model() -> str:
 
 
 async def handle_chat_completions(request: Request) -> Any:
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
     client_ip = request.client.host if request.client else "unknown"
     if rate_limiter.is_limited(client_ip):
         return json_error(429, ERR_TOO_MANY_REQUESTS)
@@ -209,6 +270,7 @@ async def handle_chat_completions(request: Request) -> Any:
     llm_messages = messages
     user_text = latest_user_text(messages)
     query_matched_memories: list[dict[str, Any]] = []
+    retrieval_trace_items: list[dict[str, Any]] = []
 
     if user_disputes_identity(user_text):
         dispute_answer = build_identity_dispute_answer()
@@ -220,17 +282,43 @@ async def handle_chat_completions(request: Request) -> Any:
 
     if MEMORY_ENABLED and user_text:
         try:
-            memories = memory_service.search(query=user_text, memory_scope=memory_scope, limit=10)
+            memories = memory_service.retrieve_memory(query=user_text, memory_scope=memory_scope, limit=10)
+            retrieval_trace_items = memories[:]
+            memory_service.log_retrieval_decision(
+                trace_id=request_id,
+                memory_scope=memory_scope,
+                query_text=user_text,
+                retrieved_items=retrieval_trace_items,
+                method_used="vector",
+            )
             query_matched_memories = matched_memories_for_query(user_text, select_context_memories(user_text, memories))
             if not query_matched_memories and detect_fact_slots(user_text).intersection({"name", "university", "email"}):
                 trusted = memory_service.list_profile_facts(memory_scope=memory_scope, limit=20) or memory_service.list_profile_facts(memory_scope="global", limit=20)
                 query_matched_memories = matched_memories_for_query(user_text, trusted)
             llm_messages = inject_memory_context(messages, query_matched_memories)
         except Exception as exc:
+            memory_service.log_retrieval_decision(
+                trace_id=request_id,
+                memory_scope=memory_scope,
+                query_text=user_text,
+                retrieved_items=[],
+                method_used="structured",
+            )
             logger.warning("Memory retrieval failed: %s", exc)
 
     if has_multimodal(llm_messages) and not VISION_MODEL:
         return json_error(400, "Image input detected but VISION_MODEL is not configured. Set VISION_MODEL to a vision-capable NVIDIA NIM model id.")
+    unsupported_image_input = find_unsupported_image_input(llm_messages) if has_multimodal(llm_messages) else None
+    if unsupported_image_input == "inline-base64":
+        return json_error(
+            400,
+            "Image input uses inline base64 data URL. This vision path requires an http/https public image URL.",
+        )
+    if unsupported_image_input == "private-url":
+        return json_error(
+            400,
+            "Image input URL is private/local. Please provide a publicly reachable image URL.",
+        )
 
     selected_model = pick_upstream_model(llm_messages, default_model=DEFAULT_UPSTREAM_MODEL, bangla_model=BANGLA_MODEL, code_model=CODE_MODEL or None, vision_model=VISION_MODEL or None)
     upstream_model = choose_runtime_model(selected_model)
@@ -252,9 +340,23 @@ async def handle_chat_completions(request: Request) -> Any:
         return StreamingResponse(approval_only_stream(), media_type="text/event-stream")
 
     if MEMORY_ENABLED and user_text and looks_like_structured_document_text(user_text) and not has_multimodal(llm_messages):
-        try: memory_service.maybe_store_from_user_turn(text=user_text, memory_scope=memory_scope)
-        except Exception as exc: logger.warning("Structured document memory write failed: %s", exc)
-        ingest_ack = build_document_ingest_ack()
+        stored_ok = False
+        try:
+            memory_service.maybe_store_from_user_turn(text=user_text, memory_scope=memory_scope)
+            # Confirm persistence before claiming success.
+            stored_ok = bool(
+                memory_service.latest_profile_full(memory_scope=memory_scope)
+                or memory_service.latest_profile_full(memory_scope="global")
+                or memory_service.latest_profile_full_any_scope()
+            )
+        except Exception as exc:
+            logger.warning("Structured document memory write failed: %s", exc)
+            stored_ok = False
+        ingest_ack = (
+            build_document_ingest_ack()
+            if stored_ok
+            else "I received your structured text, but memory persistence failed. Please retry and I will save it."
+        )
         if not stream:
             return build_non_stream_response(tool_prefix + ingest_ack)
 
@@ -307,17 +409,65 @@ async def handle_chat_completions(request: Request) -> Any:
                 )
                 if local_fallback:
                     text = local_fallback
+            if (
+                MEMORY_ENABLED
+                and user_text
+                and is_personal_memory_query(user_text)
+                and should_reject_personal_answer(
+                    user_text=user_text,
+                    response_text=text,
+                    memories=query_matched_memories,
+                )
+            ):
+                safe_fallback = resolve_local_personal_fallback(
+                    user_text=user_text,
+                    memory_scope=memory_scope,
+                    query_matched_memories=query_matched_memories,
+                ) or build_memory_missing_answer(user_text)
+                if safe_fallback:
+                    text = safe_fallback
             if MEMORY_ENABLED and user_text:
-                memory_service.maybe_store_from_user_turn(text=user_text, memory_scope=memory_scope)
-                memory_service.maybe_store_from_assistant_turn(text=text, memory_scope=memory_scope)
+                memory_pipeline.enqueue(
+                    memory_scope=memory_scope,
+                    user_text=user_text,
+                    assistant_text=text,
+                )
+                memory_service.log_chat_trace(
+                    request_id=request_id,
+                    memory_scope=memory_scope,
+                    user_text=user_text,
+                    assistant_text=text,
+                    model=upstream_model,
+                    retrieved_items=retrieval_trace_items,
+                    had_error=False,
+                )
             return build_non_stream_response(tool_prefix + text)
         except Exception as exc:
             if should_fallback_bangla_model(upstream_model, str(exc)):
                 mark_model_unavailable(BANGLA_MODEL, BANGLA_MODEL_COOLDOWN_SECONDS)
                 text = await complete_llm(llm_messages, model=bangla_fallback_model())
                 return build_non_stream_response(tool_prefix + text)
-            fallback_answer = build_memory_fallback_answer(user_text, query_matched_memories)
+            persist_user_memory_on_failure(user_text=user_text, memory_scope=memory_scope)
+            fallback_answer = None
+            if MEMORY_ENABLED and user_text and is_personal_memory_query(user_text):
+                fallback_answer = resolve_local_personal_fallback(
+                    user_text=user_text,
+                    memory_scope=memory_scope,
+                    query_matched_memories=query_matched_memories,
+                )
+            if not fallback_answer:
+                fallback_answer = build_memory_fallback_answer(user_text, query_matched_memories)
             if fallback_answer:
+                if MEMORY_ENABLED and user_text:
+                    memory_service.log_chat_trace(
+                        request_id=request_id,
+                        memory_scope=memory_scope,
+                        user_text=user_text,
+                        assistant_text=fallback_answer,
+                        model=upstream_model,
+                        retrieved_items=retrieval_trace_items,
+                        had_error=True,
+                    )
                 return build_non_stream_response(tool_prefix + fallback_answer)
             return json_error(502, normalize_chat_error(exc, had_image_input=has_multimodal(llm_messages), model=upstream_model))
 
@@ -327,12 +477,77 @@ async def handle_chat_completions(request: Request) -> Any:
         hold_personal_stream = bool(user_text and is_personal_memory_query(user_text) and not is_vision_request)
         if tool_prefix:
             yield sse_data(build_chunk_payload(chunk_id="tool", delta_content=tool_prefix))
+        if is_vision_request:
+            # Send one visible status line for UX, then keep alive silently.
+            yield sse_data(build_chunk_payload(chunk_id="vision-status", delta_content="Processing image..."))
+            # Keep stream alive with SSE comments while upstream vision runs.
+            # Comments are not rendered as assistant text by clients.
+            yield ":\n\n"
+            try:
+                timeout_s = float(max(8, VISION_STREAM_TIMEOUT_SECONDS))
+                heartbeat_s = 5.0
+                elapsed_s = 0.0
+                task = asyncio.create_task(complete_llm(llm_messages, model=upstream_model))
+                while not task.done():
+                    wait_s = min(heartbeat_s, max(0.1, timeout_s - elapsed_s))
+                    await asyncio.wait({task}, timeout=wait_s)
+                    if task.done():
+                        break
+                    elapsed_s += wait_s
+                    if elapsed_s >= timeout_s:
+                        task.cancel()
+                        yield sse_data(
+                            build_chunk_payload(
+                                chunk_id="error",
+                                delta_content="[ERROR] Image analysis is taking too long. Please retry with a smaller/public image URL.",
+                                finish_reason="stop",
+                            )
+                        )
+                        yield "data: [DONE]\n\n"
+                        return
+                    yield ":\n\n"
+                vision_text = await task
+                if is_generic_image_refusal(vision_text):
+                    vision_text = build_image_refusal_diagnostic(upstream_model)
+                if vision_text:
+                    yield sse_data(build_chunk_payload(chunk_id="chatcmpl-local", delta_content=vision_text))
+                if MEMORY_ENABLED and user_text and vision_text:
+                    memory_pipeline.enqueue(
+                        memory_scope=memory_scope,
+                        user_text=user_text,
+                        assistant_text=vision_text,
+                    )
+                    memory_service.log_chat_trace(
+                        request_id=request_id,
+                        memory_scope=memory_scope,
+                        user_text=user_text,
+                        assistant_text=vision_text,
+                        model=upstream_model,
+                        retrieved_items=retrieval_trace_items,
+                        had_error=False,
+                    )
+                yield "data: [DONE]\n\n"
+                return
+            except Exception as exc:
+                msg = normalize_chat_error(exc, had_image_input=True, model=upstream_model)
+                yield sse_data(build_chunk_payload(chunk_id="error", delta_content=f"[ERROR] {msg}", finish_reason="stop"))
+                yield "data: [DONE]\n\n"
+                return
         collected_tokens: list[str] = []
         try:
             async for token in stream_llm(llm_messages, model=upstream_model):
                 if token:
                     if is_upstream_error_token(token):
-                        fallback_answer = build_memory_fallback_answer(user_text, query_matched_memories)
+                        persist_user_memory_on_failure(user_text=user_text, memory_scope=memory_scope)
+                        fallback_answer = None
+                        if MEMORY_ENABLED and user_text and is_personal_memory_query(user_text):
+                            fallback_answer = resolve_local_personal_fallback(
+                                user_text=user_text,
+                                memory_scope=memory_scope,
+                                query_matched_memories=query_matched_memories,
+                            )
+                        if not fallback_answer:
+                            fallback_answer = build_memory_fallback_answer(user_text, query_matched_memories)
                         if fallback_answer and not collected_tokens:
                             yield sse_data(build_chunk_payload(chunk_id="memory-fallback", delta_content=fallback_answer))
                         else:
@@ -348,6 +563,7 @@ async def handle_chat_completions(request: Request) -> Any:
                     if not is_vision_request and not hold_personal_stream:
                         yield sse_data(build_chunk_payload(chunk_id="chatcmpl-local", delta_content=token))
         except Exception as exc:
+            persist_user_memory_on_failure(user_text=user_text, memory_scope=memory_scope)
             fallback_answer = build_memory_fallback_answer(user_text, query_matched_memories)
             if fallback_answer and not collected_tokens:
                 yield sse_data(build_chunk_payload(chunk_id="memory-fallback", delta_content=fallback_answer))
@@ -371,6 +587,25 @@ async def handle_chat_completions(request: Request) -> Any:
                 final_text = local_fallback
                 if not hold_personal_stream:
                     yield sse_data(build_chunk_payload(chunk_id="memory-fallback", delta_content=local_fallback))
+        if (
+            MEMORY_ENABLED
+            and user_text
+            and is_personal_memory_query(user_text)
+            and should_reject_personal_answer(
+                user_text=user_text,
+                response_text=final_text,
+                memories=query_matched_memories,
+            )
+        ):
+            safe_fallback = resolve_local_personal_fallback(
+                user_text=user_text,
+                memory_scope=memory_scope,
+                query_matched_memories=query_matched_memories,
+            ) or build_memory_missing_answer(user_text)
+            if safe_fallback:
+                final_text = safe_fallback
+                if not hold_personal_stream:
+                    yield sse_data(build_chunk_payload(chunk_id="memory-fallback", delta_content=safe_fallback))
         if hold_personal_stream and final_text:
             yield sse_data(build_chunk_payload(chunk_id="chatcmpl-local", delta_content=final_text))
         if is_vision_request and final_text:
@@ -378,8 +613,20 @@ async def handle_chat_completions(request: Request) -> Any:
                 final_text = build_image_refusal_diagnostic(upstream_model)
             yield sse_data(build_chunk_payload(chunk_id="chatcmpl-local", delta_content=final_text))
         if MEMORY_ENABLED and user_text and collected_tokens:
-            memory_service.maybe_store_from_user_turn(text=user_text, memory_scope=memory_scope)
-            memory_service.maybe_store_from_assistant_turn(text=final_text, memory_scope=memory_scope)
+            memory_pipeline.enqueue(
+                memory_scope=memory_scope,
+                user_text=user_text,
+                assistant_text=final_text,
+            )
+            memory_service.log_chat_trace(
+                request_id=request_id,
+                memory_scope=memory_scope,
+                user_text=user_text,
+                assistant_text=final_text,
+                model=upstream_model,
+                retrieved_items=retrieval_trace_items,
+                had_error=False,
+            )
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")

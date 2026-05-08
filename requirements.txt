@@ -7,3 +7,10 @@ python-multipart
 mcp
 sqlalchemy
 faiss-cpu
+redis
+rq
+pgvector
+psycopg2-binary
+langchain
+langchain-core
+langgraph

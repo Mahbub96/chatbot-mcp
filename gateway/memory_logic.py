@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+MIN_MEMORY_FACT_CONFIDENCE = 0.75
+
 
 def select_context_memories(user_text: str, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized_query = (user_text or "").strip().lower()
@@ -84,7 +86,25 @@ def detect_fact_slots(text: str) -> set[str]:
         slots.add("cv")
     if any(k in t for k in ("email", "mail", "ইমেইল")):
         slots.add("email")
-    if any(k in t for k in ("office", "work", "company", "employer", "job", "কাজ", "অফিস")):
+    if any(
+        k in t
+        for k in (
+            "office",
+            "work",
+            "company",
+            "employer",
+            "job",
+            "role",
+            "experience",
+            "profession",
+            "occupation",
+            "career",
+            "designation",
+            "কাজ",
+            "অফিস",
+            "পেশা",
+        )
+    ):
         slots.add("work")
     return slots
 
@@ -441,7 +461,11 @@ def matched_memories_for_query(query_text: str, memories: list[dict[str, Any]]) 
             continue
         if not has_slot_match(query, text):
             continue
-        if text_token_overlap(query, text) < 0.12 and detect_fact_slots(query):
+        if (
+            src != "profile_full"
+            and text_token_overlap(query, text) < 0.12
+            and detect_fact_slots(query)
+        ):
             continue
         if q_slots.intersection({"name", "university", "email"}):
             if src == "chat_assistant":
@@ -469,18 +493,117 @@ def build_memory_fallback_answer(user_text: str, memories: list[dict[str, Any]])
     for item in memories:
         top_text = (item.get("text") or "").strip()
         source = (item.get("source") or "").strip().lower()
+        confidence = float(item.get("confidence") or 0.0)
+        if confidence < MIN_MEMORY_FACT_CONFIDENCE:
+            continue
         if not top_text or is_low_quality_memory_text(top_text) or has_question_like_shape(top_text):
             continue
         if not has_slot_match(user_text, top_text):
             continue
-        # For slot-specific questions (name/university/email/etc), avoid dumping full documents.
+        # For slot-specific questions, avoid dumping full documents unless we can extract
+        # a concise slot-related snippet (important for work/role info often stored in CV text).
         if query_slots and source == "profile_full":
+            # Keep concise fact preference for most slots; use profile_full extraction
+            # primarily for work/role info that is often only present in resume text.
+            if "work" in query_slots:
+                extracted = extract_profile_full_slot_fact(user_text, top_text)
+                if extracted:
+                    return f"Saved fact: {extracted}"
             continue
         if query_slots and ":" not in top_text and len(top_text) > 180:
             continue
         if ":" in top_text:
             return f"Saved fact: {top_text}"
+        if "work" in query_slots:
+            extracted_work = extract_work_fact_from_text(top_text)
+            if extracted_work:
+                return f"Saved fact: {extracted_work}"
         return f"Possible memory (not fully verified): {top_text}"
+    return None
+
+
+def extract_work_fact_from_text(text: str) -> str | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    compact = " ".join(raw.split())
+    patterns = (
+        r"(?i)\bmy profession is ([^.]{2,120})",
+        r"(?i)\bi work as ([^.]{2,120})",
+        r"(?i)\bi work at ([^.]{2,120})",
+        r"(?i)\brole\s*[:=-]\s*([^.]{2,120})",
+        r"(?i)\bcompany\s*[:=-]\s*([^.]{2,120})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, compact)
+        if not match:
+            continue
+        value = (match.group(1) or "").strip(" ,.;:-")
+        if not value:
+            continue
+        lowered = pattern.lower()
+        if "work at" in lowered or "company" in lowered:
+            return f"company: {value}"
+        return f"profession: {value}"
+    if any(k in compact.lower() for k in ("engineer", "developer", "manager", "analyst")):
+        return f"profession: {compact}"
+    return None
+
+
+def extract_profile_full_slot_fact(query_text: str, profile_text: str) -> str | None:
+    slots = detect_fact_slots(query_text)
+    if not slots:
+        return None
+    raw = (profile_text or "").strip()
+    if not raw:
+        return None
+    normalized = " ".join(raw.replace("\\n", "\n").split())
+    if len(normalized) > 3000:
+        normalized = normalized[:3000]
+    lower = normalized.lower()
+    slot_keywords: dict[str, tuple[str, ...]] = {
+        "work": ("work", "worked", "office", "company", "employer", "role", "experience", "brotecs"),
+        "university": ("university", "education", "varsity", "campus"),
+        "email": ("email", "@"),
+        "name": ("name", "full name"),
+        "hobby": ("hobby", "interests"),
+        "favorite": ("favorite", "favourite"),
+    }
+    for slot in ("work", "university", "email", "name", "hobby", "favorite"):
+        if slot not in slots:
+            continue
+        keywords = slot_keywords.get(slot, ())
+        candidates: list[tuple[int, str]] = []
+        segments = re.split(r"[.;]|\\section\*?\{[^}]*\}|\\entryheader\{[^}]*\}\{[^}]*\}", normalized)
+        for seg in segments:
+            snippet = " ".join(seg.split()).strip(" ,.;:-")
+            if len(snippet) < 12:
+                continue
+            s_lower = snippet.lower()
+            if not any(kw in s_lower for kw in keywords):
+                continue
+            if slot == "work":
+                score = 0
+                if any(k in s_lower for k in ("worked", "work", "company", "employer", "role", "experience", "brotecs", "technologies", "software engineer")):
+                    score += 4
+                if any(k in s_lower for k in ("year", "years", "month", "present")):
+                    score += 2
+                if "@" in s_lower:
+                    score -= 3
+                if "education" in s_lower:
+                    score -= 2
+                if score <= 0:
+                    continue
+                candidates.append((score, snippet))
+            else:
+                candidates.append((1, snippet))
+        if candidates:
+            candidates.sort(key=lambda x: (x[0], len(x[1])), reverse=True)
+            best = candidates[0][1]
+            best = re.sub(r"\\[a-zA-Z]+\*?\{", "", best)
+            best = best.replace("}", " ")
+            best = " ".join(best.split())
+            return best.strip(" ,.;:-")
     return None
 
 
@@ -495,6 +618,9 @@ def build_memory_first_answer(user_text: str, memories: list[dict[str, Any]]) ->
     top = memories[0]
     top_source = (top.get("source") or "").strip().lower()
     top_text = (top.get("text") or "").strip()
+    top_confidence = float(top.get("confidence") or 0.0)
+    if top_confidence < MIN_MEMORY_FACT_CONFIDENCE:
+        return None
     if not top_text or is_low_quality_memory_text(top_text):
         return None
     if top_source == "chat_assistant" or has_question_like_shape(top_text) or len(top_text) > 400:
@@ -514,7 +640,29 @@ def is_personal_memory_query(text: str) -> bool:
     t = (text or "").strip().lower()
     if not t:
         return False
-    personal_signals = ("my ", "amar ", "আমার", "name", "nam", "hobby", "cv", "resume", "university", "email")
+    personal_signals = (
+        "my ",
+        "amar ",
+        "আমার",
+        "name",
+        "nam",
+        "hobby",
+        "cv",
+        "resume",
+        "university",
+        "email",
+        "office",
+        "work",
+        "company",
+        "employer",
+        "role",
+        "where i work",
+        "profession",
+        "occupation",
+        "career",
+        "designation",
+        "পেশা",
+    )
     return any(sig in t for sig in personal_signals)
 
 
@@ -522,6 +670,51 @@ def build_memory_missing_answer(user_text: str) -> str | None:
     if not is_personal_memory_query(user_text):
         return None
     return "I couldn't find an exact saved fact for this yet. If you share it once, I will store it as a fact for next time."
+
+
+def should_reject_personal_answer(
+    *,
+    user_text: str,
+    response_text: str,
+    memories: list[dict[str, Any]],
+) -> bool:
+    query = (user_text or "").strip().lower()
+    answer = (response_text or "").strip().lower()
+    if not query or not answer:
+        return False
+    if not is_personal_memory_query(query):
+        return False
+    # If the model is already uncertain, keep it (safe behavior).
+    uncertainty_markers = (
+        "i don't have",
+        "i do not have",
+        "i'm not sure",
+        "i am not sure",
+        "not enough information",
+        "couldn't find",
+    )
+    if any(marker in answer for marker in uncertainty_markers):
+        return False
+
+    query_slots = detect_fact_slots(query)
+    answer_slots = detect_fact_slots(answer)
+    if query_slots and not query_slots.intersection(answer_slots):
+        return True
+
+    # Profession/work questions must not be answered with plain link-only facts.
+    if "work" in query_slots:
+        if any(tok in answer for tok in ("linkedin.com", "http://", "https://", "www.")):
+            work_terms = ("engineer", "developer", "manager", "analyst", "role", "company", "employer", "work")
+            if not any(term in answer for term in work_terms):
+                return True
+
+    # Guard against answers unrelated to top matched memory content.
+    if memories:
+        top = memories[0]
+        top_text = (top.get("text") or "").strip()
+        if top_text and text_token_overlap(answer, top_text) < 0.08 and query_slots:
+            return True
+    return False
 
 
 def user_disputes_identity(text: str) -> bool:

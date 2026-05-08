@@ -5,7 +5,14 @@ from typing import Any
 from fastapi import APIRouter, Request
 
 from agent.llm import edit_image, generate_image
-from config import IMAGE_BASE_URL, IMAGE_EDIT_BASE_URL, IMAGE_EDIT_MODEL, IMAGE_GEN_MODEL
+from config import (
+    IMAGE_BASE_URL,
+    IMAGE_EDIT_BASE_URL,
+    IMAGE_EDIT_MODEL,
+    IMAGE_GEN_MODEL,
+    RATE_LIMIT_MAX_REQUESTS,
+    RATE_LIMIT_WINDOW_SECONDS,
+)
 from gateway.helpers.http_utils import json_error
 from gateway.helpers.rate_limiter import InMemoryRateLimiter
 
@@ -13,7 +20,10 @@ ERR_TOO_MANY_REQUESTS = "Too many requests"
 ERR_INVALID_JSON_BODY = "Invalid JSON body"
 ERR_BODY_OBJECT_REQUIRED = "Request body must be an object"
 router = APIRouter()
-rate_limiter = InMemoryRateLimiter(window_seconds=100, max_requests=100)
+rate_limiter = InMemoryRateLimiter(
+    window_seconds=max(1, RATE_LIMIT_WINDOW_SECONDS),
+    max_requests=max(1, RATE_LIMIT_MAX_REQUESTS),
+)
 def normalize_image_error(exc: Exception, *, model: str, endpoint: str, action: str) -> str:
     msg = str(exc)
     if "[LLM_ERROR 404]" in msg:

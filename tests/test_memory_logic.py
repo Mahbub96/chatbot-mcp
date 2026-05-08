@@ -3,6 +3,7 @@ import unittest
 from gateway.memory_logic import build_memory_first_answer
 from gateway.memory_logic import build_memory_fallback_answer
 from gateway.memory_logic import detect_fact_slots
+from gateway.memory_logic import is_personal_memory_query
 
 
 class MemoryLogicTest(unittest.TestCase):
@@ -40,6 +41,25 @@ class MemoryLogicTest(unittest.TestCase):
     def test_detect_work_slot(self):
         self.assertIn("work", detect_fact_slots("where I work ?"))
         self.assertIn("work", detect_fact_slots("my office name"))
+        self.assertIn("work", detect_fact_slots("what is my role?"))
+
+    def test_profile_full_work_query_extracts_generic_snippet(self):
+        answer = build_memory_fallback_answer(
+            "where I work ?",
+            [
+                {
+                    "source": "profile_full",
+                    "text": "Email: x@example.com. Experience: Worked at Brotecs for more than 2 years as Software Engineer role in backend team.",
+                }
+            ],
+        )
+        self.assertIsNotNone(answer)
+        self.assertIn("Saved fact:", answer)
+        self.assertIn("Brotecs", answer)
+        self.assertNotIn("Email:", answer)
+
+    def test_work_query_is_personal_memory_query(self):
+        self.assertTrue(is_personal_memory_query("where I work ?"))
 
 
 if __name__ == "__main__":

@@ -33,11 +33,19 @@ def load_tools():
         if module_info.name.startswith("__"):
             continue
 
-        module = importlib.import_module(f"tools.{module_info.name}")
+        try:
+            module = importlib.import_module(f"tools.{module_info.name}")
+        except Exception as exc:
+            logger.exception("[TOOL LOAD FAILED] %s: %s", module_info.name, exc)
+            continue
 
         if hasattr(module, "tool_name") and hasattr(module, "run"):
-            TOOLS[module.tool_name] = module.run
-            logger.info("[TOOL LOADED] %s", module.tool_name)
+            tool_name = str(module.tool_name)
+            if tool_name in TOOLS:
+                logger.warning("[TOOL DUPLICATE] keeping first, skipped=%s", tool_name)
+                continue
+            TOOLS[tool_name] = module.run
+            logger.info("[TOOL LOADED] %s", tool_name)
 
 
 # load at import time
@@ -108,6 +116,8 @@ def run_tool(name: str, args: dict):
         logger.info("[TOOL] %s | args=%s", name, filtered_args)
 
         result = tool(**filtered_args)
+        if result is None:
+            result = {"status": "ok"}
 
         return {
             "success": True,

@@ -34,5 +34,12 @@ def execute_tool_with_policy(name: str, args: dict[str, Any], approval_id: str |
                 "tool": name,
                 "arguments": args,
             }
-    return {"success": True, "tool": name, "result": run_tool(name, args)}
+    tool_result = run_tool(name, args)
+    if not isinstance(tool_result, dict):
+        return {
+            "success": False,
+            "tool": name,
+            "error": "Tool returned unsupported response type",
+        }
+    return tool_result
 

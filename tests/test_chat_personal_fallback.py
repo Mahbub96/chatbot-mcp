@@ -38,6 +38,69 @@ class ChatPersonalFallbackTest(unittest.TestCase):
         content = res.json()["choices"][0]["message"]["content"]
         self.assertIn("Saved fact: university:", content)
 
+    def test_stream_image_sends_progress_chunk(self):
+        async def fake_complete(_messages, model=None):
+            return "Image looks good."
+
+        with patch("gateway.controllers.chat_controller.complete_llm", fake_complete):
+            res = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "stream": True,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "explain this image"},
+                                {"type": "image_url", "image_url": {"url": "https://example.com/demo.png"}},
+                            ],
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        body = res.text
+        self.assertIn("Processing image...", body)
+        self.assertIn("Image looks good.", body)
+
+    def test_rejects_inline_base64_image_url(self):
+        res = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "stream": False,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "describe"},
+                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                        ],
+                    }
+                ],
+            },
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("inline base64", res.text)
+
+    def test_rejects_private_image_url(self):
+        res = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "stream": False,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "describe"},
+                            {"type": "image_url", "image_url": {"url": "http://127.0.0.1:9000/demo.png"}},
+                        ],
+                    }
+                ],
+            },
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("private/local", res.text)
+
 
 if __name__ == "__main__":
     unittest.main()

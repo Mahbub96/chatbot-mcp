@@ -57,13 +57,43 @@ def has_multimodal(messages: list[dict[str, Any]]) -> bool:
     return any(isinstance(msg.get("content"), list) for msg in messages)
 
 
+def _normalized_scope(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    value = raw.strip().lower()
+    if not value:
+        return ""
+    # Keep scope tokens filesystem/sql friendly.
+    safe = "".join(ch if (ch.isalnum() or ch in {"@", ".", "_", "-"}) else "_" for ch in value)
+    return safe[:128].strip("_")
+
+
 def resolve_memory_scope(request: Request, body: dict[str, Any]) -> str:
     body_scope = body.get("memory_scope")
-    if isinstance(body_scope, str) and body_scope.strip():
-        return body_scope.strip()
-    header_scope = request.headers.get("x-memory-scope")
-    if isinstance(header_scope, str) and header_scope.strip():
-        return header_scope.strip()
+    normalized_body_scope = _normalized_scope(body_scope)
+    if normalized_body_scope:
+        return normalized_body_scope
+
+    # Explicit scope header has top priority after request body.
+    explicit_scope = _normalized_scope(request.headers.get("x-memory-scope"))
+    if explicit_scope:
+        return explicit_scope
+
+    # Permanent stable fallback from user identity headers.
+    # This keeps one user mapped to one scope automatically.
+    for key in (
+        "x-user-email",
+        "x-openwebui-user-email",
+        "x-auth-request-email",
+        "x-forwarded-email",
+        "x-user-id",
+        "x-openwebui-user-id",
+        "x-auth-request-user",
+        "x-forwarded-user",
+    ):
+        candidate = _normalized_scope(request.headers.get(key))
+        if candidate:
+            return candidate
     return "global"
 
 

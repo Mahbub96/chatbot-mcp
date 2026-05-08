@@ -65,6 +65,7 @@ webui.db
 *.sqlite
 *.sqlite3
 *.db
+*.db-*
 
 backend/data/
 data/
@@ -125,3 +126,4 @@ credentials.json
 service-account.json
 .___pycache__
 ._*
+files/memory.db*

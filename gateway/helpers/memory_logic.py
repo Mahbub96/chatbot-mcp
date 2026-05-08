@@ -1,2 +1,2 @@
-from gateway.memory_logic import *  # noqa: F401,F403
+from memory.services.memory_logic_service import *  # noqa: F401,F403
 

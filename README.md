@@ -24,8 +24,8 @@ This project runs a local chat stack with:
   - Code-heavy prompts -> `CODE_MODEL` (if set)
   - Image/multimodal requests -> `VISION_MODEL` (if set)
   - Fallback -> `DEFAULT_MODEL`
-- Persistent memory (MVP):
-  - Vector retrieval via FAISS
+- Persistent memory (MVP/production-ready path):
+  - Vector retrieval via FAISS or pgvector (HNSW)
   - Durable records via SQLite + SQLAlchemy ORM
   - Memory-augmented chat responses
 
@@ -62,6 +62,10 @@ Tooling:
 
 - **`NVIDIA_API_KEY`**: required for NVIDIA hosted NIM.
 - **`DEFAULT_MODEL`**: upstream model id for normal (non-Bangla) routing.
+- **`EMBEDDING_BASE_URL`**: embeddings endpoint URL (OpenAI-compatible).
+- **`EMBEDDING_MODEL`**: model id used for real memory embeddings.
+- **`EMBEDDING_DIM`**: embedding dimensionality used by local vector index.
+- **`EMBEDDING_TIMEOUT_SECONDS`**: timeout for embedding HTTP calls.
 - **`BANGLA_MODEL`**: optional upstream model id for Bangla routing.
 - **`CODE_MODEL`**: optional upstream model id for coding-focused prompts.
 - **`VISION_MODEL`**: optional vision-capable model id for image inputs.
@@ -71,10 +75,21 @@ Tooling:
 - **`MEMORY_ENABLED`**: enables memory retrieval/storage in chat flow.
 - **`MEMORY_SQLITE_URL`**: SQLAlchemy database URL for memory records.
 - **`MEMORY_VECTOR_PATH`**: persistent folder path for FAISS vector index.
+- **`MEMORY_VECTOR_BACKEND`**: vector backend (`faiss` or `pgvector`).
 - **`MEMORY_TOP_K`**: number of memory items retrieved per request.
 - **`MEMORY_MIN_SCORE`**: retrieval score threshold for injected memory.
+- **`PGVECTOR_HNSW_M`**: pgvector HNSW graph connectivity parameter.
+- **`PGVECTOR_HNSW_EF_CONSTRUCTION`**: pgvector HNSW build-time recall/speed parameter.
 - **`MEMORY_AUTO_STORE`**: whether chat user turns are auto-stored.
 - **`MEMORY_MAX_ITEMS`**: cap per memory scope before pruning oldest records.
+- **`SHORT_TERM_TRACE_MAX_ITEMS`**: cap per scope for chat trace rows.
+- **`MEMORY_QUEUE_BACKEND`**: memory async backend (`inprocess` or `rq`).
+- **`MEMORY_REDIS_URL`**: Redis connection URL used by RQ.
+- **`MEMORY_RQ_QUEUE`**: RQ queue name for memory jobs.
+- **`RATE_LIMIT_WINDOW_SECONDS`**: global rate-limit window size in seconds.
+- **`RATE_LIMIT_MAX_REQUESTS`**: max requests per client IP within the window.
+- **`LOG_JSON`**: enable structured JSON request logs.
+- **`VISION_STREAM_TIMEOUT_SECONDS`**: max time to wait for vision response in streamed chat before timeout error.
 
 Use `.env.example` as template:
 
@@ -92,6 +107,16 @@ bash start.sh
 Open WebUI: `http://localhost:3000`  
 Gateway API: `http://127.0.0.1:8000`
 
+### Optional: run external RQ memory worker (production)
+
+When `MEMORY_QUEUE_BACKEND=rq`, chat requests enqueue memory jobs into Redis and a separate worker processes them:
+
+```bash
+python gateway/rq_worker.py
+```
+
+If Redis or RQ is unavailable, the gateway safely falls back to in-process background queueing.
+
 ## Quick API checks
 
 ```bash
@@ -100,7 +125,48 @@ curl http://127.0.0.1:8000/v1/models
 
 # list local MCP tools
 curl http://127.0.0.1:8000/mcp/tools
+
+# liveness/readiness probes
+curl http://127.0.0.1:8000/health/live
+curl http://127.0.0.1:8000/health/ready
+
+# prometheus metrics
+curl http://127.0.0.1:8000/metrics
 ```
+
+## Operations
+
+- Health probes:
+  - `GET /health/live` returns process liveness.
+  - `GET /health/ready` returns readiness; responds `503` when dependencies are unavailable.
+- Metrics:
+  - `GET /metrics` exposes Prometheus text metrics for request counts and latency sum.
+- Request tracing:
+  - Every response includes `X-Request-Id` and `X-Process-Time-Ms`.
+  - When `LOG_JSON=true`, middleware emits structured per-request logs.
+- Graceful shutdown:
+  - On shutdown, the gateway closes upstream async HTTP clients to avoid leaked connections.
+
+## Hybrid Retrieval Pipeline
+
+```text
+Client -> /chat or /v1/chat/completions
+      -> Model Router (vision/code/bangla/default)
+      -> Fast Path (LLM response, stream/non-stream)
+      -> Optional Memory Retrieval (ANN HNSW -> metadata filter -> FTS fallback)
+      -> Response to client (<1s target for text-only)
+      -> Async Memory Queue (background worker)
+           -> importance/category classifier
+           -> durable write (SQLite/Postgres-compatible schema)
+           -> FAISS HNSW index update
+```
+
+- **Fast path** keeps user-visible latency low by avoiding blocking memory writes.
+- **Async path** classifies and stores only useful facts (`person`, `education`, `work`, `preference`, `event`, `contact`).
+- **Fallback retrieval** uses lexical/FTS search if ANN similarity misses.
+- **Vector backend switch** keeps the same app API while allowing:
+  - local `faiss` for simple setups
+  - `pgvector` on PostgreSQL for production HNSW ANN
 
 ## Cursor AI integration (both)
 
@@ -149,9 +215,8 @@ For image editing, use `/v1/images/edits` with `IMAGE_EDIT_MODEL`.
 ## Image input behavior (important)
 
 - Image explanation in chat is supported through `POST /v1/chat/completions`.
-- The gateway accepts both:
-  - publicly reachable image URLs
-  - base64 data URLs (for example uploads from chat UI)
+- The gateway requires publicly reachable `http/https` image URLs.
+- Inline base64 image data URLs and private/local URLs are rejected with clear `400` errors.
 - For stability with some upstream vision models, the gateway uses a non-stream upstream call for image requests and then returns the result to clients (including SSE clients).
 - Image requests can be slower than text-only requests (often much longer first-token latency depending on model/provider load).
 
