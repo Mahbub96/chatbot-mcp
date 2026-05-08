@@ -6,8 +6,19 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from agent.llm import complete_llm, stream_llm
-from config import BANGLA_MODEL, MODEL as DEFAULT_UPSTREAM_MODEL, VISION_MODEL
+from agent.llm import complete_llm, edit_image, generate_image, stream_llm
+from config import (
+    BANGLA_MODEL,
+    CODE_MODEL,
+    IMAGE_BASE_URL,
+    IMAGE_EDIT_MODEL,
+    IMAGE_EDIT_BASE_URL,
+    IMAGE_GEN_MODEL,
+    MODEL as DEFAULT_UPSTREAM_MODEL,
+    VISION_MODEL,
+)
+from permissions.approvals import approval_store
+from permissions.policy import evaluate_tool_action
 from router.model_router import pick_upstream_model
 from router.tool_router import maybe_run_legacy_keyword_tool
 from tools.registry import TOOLS, run_tool
@@ -71,6 +82,29 @@ def has_multimodal(messages: list[dict[str, Any]]) -> bool:
     return any(isinstance(msg.get("content"), list) for msg in messages)
 
 
+def normalize_chat_error(exc: Exception, *, had_image_input: bool, model: str) -> str:
+    msg = str(exc)
+    if had_image_input and "[LLM_ERROR 500]" in msg:
+        return (
+            "Vision request failed on upstream model. "
+            f"Configured model: {model}. "
+            "Use a publicly reachable image URL (not base64) and verify "
+            "that this model supports image understanding in your NVIDIA account."
+        )
+    return msg
+
+
+def normalize_image_error(exc: Exception, *, model: str, endpoint: str, action: str) -> str:
+    msg = str(exc)
+    if "[LLM_ERROR 404]" in msg:
+        return (
+            f"{action} endpoint/model not available for current NVIDIA account. "
+            f"model={model}, endpoint={endpoint}. "
+            "Set a valid model/endpoint pair for your account."
+        )
+    return msg
+
+
 def sse_data(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
@@ -121,6 +155,36 @@ def json_error(status_code: int, message: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": message})
 
 
+def execute_tool_with_policy(name: str, args: dict[str, Any], approval_id: str | None = None) -> dict[str, Any]:
+    policy = evaluate_tool_action(name, args)
+    if policy.requires_approval:
+        if isinstance(approval_id, str) and approval_id.strip():
+            ok, reason = approval_store.consume_if_valid(approval_id, name, args)
+            if not ok:
+                return {
+                    "success": False,
+                    "requires_approval": True,
+                    "error": reason,
+                }
+        else:
+            pending = approval_store.create(
+                tool_name=name,
+                arguments=args,
+                reason=policy.reason,
+                risk_level=policy.risk_level,
+            )
+            return {
+                "success": False,
+                "requires_approval": True,
+                "approval_id": pending.approval_id,
+                "risk_level": pending.risk_level,
+                "reason": pending.reason,
+                "tool": name,
+                "arguments": args,
+            }
+    return {"success": True, "tool": name, "result": run_tool(name, args)}
+
+
 @app.get("/v1/models")
 def models():
     return {
@@ -154,13 +218,40 @@ def list_tools():
 async def execute_tool(payload: dict[str, Any]):
     name = payload.get("name")
     args = payload.get("arguments", {})
+    approval_id = payload.get("approval_id")
 
     if not isinstance(name, str) or not name.strip():
         return {"success": False, "error": "Missing tool name"}
     if not isinstance(args, dict):
         return {"success": False, "error": "arguments must be an object"}
 
-    return {"success": True, "tool": name, "result": run_tool(name, args)}
+    return execute_tool_with_policy(name, args, approval_id=approval_id)
+
+
+@app.get("/mcp/approvals")
+def list_pending_approvals():
+    return {"pending": approval_store.list_pending()}
+
+
+@app.post("/mcp/approve")
+async def set_approval(payload: dict[str, Any]):
+    approval_id = payload.get("approval_id")
+    approved = payload.get("approved")
+    if not isinstance(approval_id, str) or not approval_id.strip():
+        return {"success": False, "error": "approval_id is required"}
+    if not isinstance(approved, bool):
+        return {"success": False, "error": "approved must be boolean"}
+
+    item = approval_store.set_decision(approval_id, approved=approved)
+    if not item:
+        return {"success": False, "error": "Approval not found"}
+
+    return {
+        "success": True,
+        "approval_id": item.approval_id,
+        "approved": item.approved,
+        "tool_name": item.tool_name,
+    }
 
 
 @app.post("/v1/chat/completions")
@@ -187,22 +278,33 @@ async def chat_completions(request: Request) -> Any:
             "Image input detected but VISION_MODEL is not configured. "
             "Set VISION_MODEL to a vision-capable NVIDIA NIM model id.",
         )
-
     upstream_model = pick_upstream_model(
         messages,
         default_model=DEFAULT_UPSTREAM_MODEL,
         bangla_model=BANGLA_MODEL,
+        code_model=CODE_MODEL or None,
         vision_model=VISION_MODEL or None,
     )
 
     tool_output = maybe_run_legacy_keyword_tool(
         messages,
-        tool_runner=lambda name, args: run_tool(name, args),
+        tool_runner=lambda name, args: execute_tool_with_policy(name, args, approval_id=None),
         test_file_path=TOOL_TEST_FILE_PATH,
     )
     tool_prefix = ""
     if tool_output is not None:
         tool_prefix = f"\n[TOOL RESULT]\n{json.dumps(tool_output)}\n"
+        # If the action is pending approval, do not continue with LLM text.
+        if tool_output.get("requires_approval") is True:
+            if not stream:
+                return build_non_stream_response(tool_prefix)
+
+            async def approval_only_stream():
+                yield ":\n\n"
+                yield sse_data(build_chunk_payload(chunk_id="tool", delta_content=tool_prefix))
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(approval_only_stream(), media_type="text/event-stream")
 
     if not stream:
         try:
@@ -210,7 +312,14 @@ async def chat_completions(request: Request) -> Any:
             return build_non_stream_response(tool_prefix + text)
         except Exception as exc:
             logger.exception("Non-stream completion failed: %s", exc)
-            return json_error(502, str(exc))
+            return json_error(
+                502,
+                normalize_chat_error(
+                    exc,
+                    had_image_input=has_multimodal(messages),
+                    model=upstream_model,
+                ),
+            )
 
     async def generate():
         # Send an initial SSE comment to flush headers quickly (prevents client/proxy timeouts
@@ -236,3 +345,82 @@ async def chat_completions(request: Request) -> Any:
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.post("/v1/images/generations")
+async def images_generations(request: Request) -> Any:
+    client_ip = request.client.host if request.client else "unknown"
+    if rate_limiter.is_limited(client_ip):
+        return json_error(429, "Too many requests")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return json_error(400, "Invalid JSON body")
+
+    if not isinstance(body, dict):
+        return json_error(400, "Request body must be an object")
+
+    prompt = body.get("prompt", "")
+    model = body.get("model") or IMAGE_GEN_MODEL
+    size = body.get("size", "1024x1024")
+    n = body.get("n", 1)
+
+    try:
+        result = await generate_image(prompt=prompt, model=model, size=size, n=n)
+        return result
+    except Exception as exc:
+        logger.exception("Image generation failed: %s", exc)
+        return json_error(
+            502,
+            normalize_image_error(
+                exc,
+                model=model,
+                endpoint=IMAGE_BASE_URL,
+                action="Image generation",
+            ),
+        )
+
+
+@app.post("/v1/images/edits")
+async def images_edits(request: Request) -> Any:
+    client_ip = request.client.host if request.client else "unknown"
+    if rate_limiter.is_limited(client_ip):
+        return json_error(429, "Too many requests")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return json_error(400, "Invalid JSON body")
+
+    if not isinstance(body, dict):
+        return json_error(400, "Request body must be an object")
+
+    prompt = body.get("prompt", "")
+    image = body.get("image", "")
+    mask = body.get("mask")
+    model = body.get("model") or IMAGE_EDIT_MODEL
+    size = body.get("size", "1024x1024")
+    n = body.get("n", 1)
+
+    try:
+        result = await edit_image(
+            prompt=prompt,
+            image=image,
+            model=model,
+            size=size,
+            n=n,
+            mask=mask,
+        )
+        return result
+    except Exception as exc:
+        logger.exception("Image edit failed: %s", exc)
+        return json_error(
+            502,
+            normalize_image_error(
+                exc,
+                model=model,
+                endpoint=IMAGE_EDIT_BASE_URL,
+                action="Image edit",
+            ),
+        )

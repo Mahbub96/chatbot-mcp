@@ -23,11 +23,31 @@ def has_image(messages: list[dict[str, Any]]) -> bool:
     return False
 
 
+def contains_code_intent(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    code_markers = (
+        "```",
+        "def ",
+        "class ",
+        "function ",
+        "import ",
+        "fix bug",
+        "debug",
+        "refactor",
+        "optimize code",
+        "write code",
+    )
+    return any(marker in lowered for marker in code_markers)
+
+
 def pick_upstream_model(
     messages: list[dict[str, Any]],
     *,
     default_model: str,
     bangla_model: str,
+    code_model: str | None = None,
     vision_model: str | None = None,
 ) -> str:
     """
@@ -39,6 +59,14 @@ def pick_upstream_model(
     """
     if vision_model and has_image(messages):
         return vision_model
+
+    if code_model:
+        for msg in reversed(messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str) and contains_code_intent(content):
+                return code_model
 
     if not bangla_model:
         return default_model

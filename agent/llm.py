@@ -1,9 +1,38 @@
 import json
 import httpx
 import logging
-from config import MODEL, BASE_URL, get_nvidia_api_key
+from config import (
+    BASE_URL,
+    IMAGE_BASE_URL,
+    IMAGE_EDIT_BASE_URL,
+    IMAGE_EDIT_MODEL,
+    IMAGE_GEN_MODEL,
+    MODEL,
+    get_nvidia_api_key,
+)
 
 logging.basicConfig(level=logging.INFO)
+
+DEFAULT_CONNECT_TIMEOUT = 20.0
+DEFAULT_WRITE_TIMEOUT = 20.0
+DEFAULT_POOL_TIMEOUT = 20.0
+TEXT_READ_TIMEOUT = 60.0
+VISION_READ_TIMEOUT = 180.0
+
+
+def _contains_image_payload(messages) -> bool:
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                return True
+    return False
 
 
 # =========================
@@ -17,7 +46,12 @@ class LLMClient:
             raise RuntimeError("Missing NVIDIA API key")
 
         self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(60.0),
+            timeout=httpx.Timeout(
+                connect=DEFAULT_CONNECT_TIMEOUT,
+                read=TEXT_READ_TIMEOUT,
+                write=DEFAULT_WRITE_TIMEOUT,
+                pool=DEFAULT_POOL_TIMEOUT,
+            ),
             limits=httpx.Limits(
                 max_connections=50,
                 max_keepalive_connections=20,
@@ -32,18 +66,52 @@ class LLMClient:
     # STREAMING CORE
     # =========================
     async def stream(self, messages, model: str | None = None):
+        is_image_request = _contains_image_payload(messages)
         payload = {
             "model": model or MODEL,
             "messages": messages,
-            "stream": True,
+            "stream": not is_image_request,
             "temperature": 0.7,
         }
+        read_timeout = VISION_READ_TIMEOUT if is_image_request else TEXT_READ_TIMEOUT
 
         try:
+            timeout = httpx.Timeout(
+                connect=DEFAULT_CONNECT_TIMEOUT,
+                read=read_timeout,
+                write=DEFAULT_WRITE_TIMEOUT,
+                pool=DEFAULT_POOL_TIMEOUT,
+            )
+
+            # Vision requests are more reliable via non-stream completion on this upstream path.
+            if is_image_request:
+                res = await self.client.post(BASE_URL, json=payload, timeout=timeout)
+                if res.status_code != 200:
+                    error_msg = f"[LLM_ERROR {res.status_code}] {res.text}"
+                    logging.error(error_msg)
+                    yield error_msg
+                    return
+                try:
+                    obj = res.json()
+                    content = (
+                        obj.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content")
+                    )
+                    if content:
+                        yield content
+                    return
+                except Exception as exc:
+                    error_msg = f"[LLM_EXCEPTION] Invalid JSON response: {str(exc)}"
+                    logging.error(error_msg)
+                    yield error_msg
+                    return
+
             async with self.client.stream(
                 "POST",
                 BASE_URL,
-                json=payload
+                json=payload,
+                timeout=timeout,
             ) as res:
 
                 # -------------------------
@@ -93,7 +161,7 @@ class LLMClient:
                         continue
 
         except httpx.RequestError as e:
-            error_msg = f"[NETWORK_ERROR] {str(e)}"
+            error_msg = f"[NETWORK_ERROR] {str(e) or repr(e)}"
             logging.error(error_msg)
             yield error_msg
 
@@ -137,3 +205,79 @@ async def complete_llm(messages, model: str | None = None) -> str:
             raise RuntimeError(token)
         chunks.append(token)
     return "".join(chunks)
+
+
+async def generate_image(
+    prompt: str,
+    model: str | None = None,
+    size: str = "1024x1024",
+    n: int = 1,
+) -> dict:
+    """
+    Generate images via NVIDIA-compatible OpenAI image generations endpoint.
+    Returns raw JSON payload from upstream.
+    """
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise RuntimeError("prompt must be a non-empty string")
+
+    payload = {
+        "model": model or IMAGE_GEN_MODEL,
+        "prompt": prompt,
+        "size": size,
+        "n": max(1, int(n)),
+    }
+
+    try:
+        res = await llm_client.client.post(IMAGE_BASE_URL, json=payload)
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"[NETWORK_ERROR] {str(exc)}") from exc
+
+    if res.status_code != 200:
+        raise RuntimeError(f"[LLM_ERROR {res.status_code}] {res.text}")
+
+    try:
+        return res.json()
+    except Exception as exc:
+        raise RuntimeError(f"[LLM_EXCEPTION] Invalid JSON response: {str(exc)}") from exc
+
+
+async def edit_image(
+    *,
+    prompt: str,
+    image: str,
+    model: str | None = None,
+    size: str = "1024x1024",
+    n: int = 1,
+    mask: str | None = None,
+) -> dict:
+    """
+    Edit images via NVIDIA-compatible OpenAI image edits endpoint.
+    `image` and optional `mask` can be URL or base64 data URL (provider dependent).
+    """
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise RuntimeError("prompt must be a non-empty string")
+    if not isinstance(image, str) or not image.strip():
+        raise RuntimeError("image must be a non-empty string")
+
+    payload = {
+        "model": model or IMAGE_EDIT_MODEL,
+        "prompt": prompt,
+        "image": image,
+        "size": size,
+        "n": max(1, int(n)),
+    }
+    if isinstance(mask, str) and mask.strip():
+        payload["mask"] = mask
+
+    try:
+        res = await llm_client.client.post(IMAGE_EDIT_BASE_URL, json=payload)
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"[NETWORK_ERROR] {str(exc)}") from exc
+
+    if res.status_code != 200:
+        raise RuntimeError(f"[LLM_ERROR {res.status_code}] {res.text}")
+
+    try:
+        return res.json()
+    except Exception as exc:
+        raise RuntimeError(f"[LLM_EXCEPTION] Invalid JSON response: {str(exc)}") from exc

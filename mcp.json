@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "local-mcp-gateway": {
+      "command": "/Volumes/Untitled 2/localMCPServer/.venv/bin/python",
+      "args": ["/Volumes/Untitled 2/localMCPServer/cursor_mcp_server.py"],
+      "cwd": "/Volumes/Untitled 2/localMCPServer",
+      "env": {
+        "GATEWAY_URL": "http://127.0.0.1:8000"
+      }
+    }
+  }
+}

@@ -45,5 +45,9 @@ def maybe_run_legacy_keyword_tool(
     if "delete file" in lowered:
         return tool_runner("file_tools", {"action": "delete", "path": test_file_path})
 
+    # Basic shell intent for "where am I" style requests.
+    if lowered.strip() in {"pwd", "read pwd", "show pwd"} or "current directory" in lowered:
+        return tool_runner("shell_command", {"command": "pwd"})
+
     return None
 
