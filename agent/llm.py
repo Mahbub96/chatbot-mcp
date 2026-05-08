@@ -93,11 +93,12 @@ class LLMClient:
                     return
                 try:
                     obj = res.json()
-                    content = (
-                        obj.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content")
-                    )
+                    choices = obj.get("choices")
+                    if isinstance(choices, list) and choices:
+                        first_choice = choices[0] if isinstance(choices[0], dict) else {}
+                    else:
+                        first_choice = {}
+                    content = first_choice.get("message", {}).get("content")
                     if content:
                         yield content
                     return
@@ -143,10 +144,12 @@ class LLMClient:
                     try:
                         obj = json.loads(data)
 
-                        delta = (
-                            obj.get("choices", [{}])[0]
-                            .get("delta", {})
-                        )
+                        choices = obj.get("choices")
+                        if isinstance(choices, list) and choices:
+                            first_choice = choices[0] if isinstance(choices[0], dict) else {}
+                        else:
+                            first_choice = {}
+                        delta = first_choice.get("delta", {})
 
                         content = delta.get("content")
 

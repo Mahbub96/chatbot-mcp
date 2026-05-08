@@ -5,3 +5,5 @@ python-dotenv
 pydantic        
 python-multipart
 mcp
+sqlalchemy
+faiss-cpu

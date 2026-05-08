@@ -24,6 +24,10 @@ This project runs a local chat stack with:
   - Code-heavy prompts -> `CODE_MODEL` (if set)
   - Image/multimodal requests -> `VISION_MODEL` (if set)
   - Fallback -> `DEFAULT_MODEL`
+- Persistent memory (MVP):
+  - Vector retrieval via FAISS
+  - Durable records via SQLite + SQLAlchemy ORM
+  - Memory-augmented chat responses
 
 ---
 
@@ -64,6 +68,13 @@ Tooling:
   - If image input is sent and `VISION_MODEL` is empty, gateway returns a clear config error.
 - **`IMAGE_GEN_MODEL`**: text-to-image generation model id (recommended: `qwen/qwen-image`).
 - **`IMAGE_EDIT_MODEL`**: image editing model id (recommended: `qwen/qwen-image-edit`).
+- **`MEMORY_ENABLED`**: enables memory retrieval/storage in chat flow.
+- **`MEMORY_SQLITE_URL`**: SQLAlchemy database URL for memory records.
+- **`MEMORY_VECTOR_PATH`**: persistent folder path for FAISS vector index.
+- **`MEMORY_TOP_K`**: number of memory items retrieved per request.
+- **`MEMORY_MIN_SCORE`**: retrieval score threshold for injected memory.
+- **`MEMORY_AUTO_STORE`**: whether chat user turns are auto-stored.
+- **`MEMORY_MAX_ITEMS`**: cap per memory scope before pruning oldest records.
 
 Use `.env.example` as template:
 
@@ -163,6 +174,28 @@ curl -X POST http://127.0.0.1:8000/mcp/approve \
 curl -X POST http://127.0.0.1:8000/mcp/execute \
   -H "content-type: application/json" \
   -d '{"name":"shell_command","arguments":{"command":"ls -la"},"approval_id":"<id>"}'
+```
+
+## Memory API (MVP)
+
+```bash
+# add memory item
+curl -X POST http://127.0.0.1:8000/memory/items \
+  -H "content-type: application/json" \
+  -d '{"memory_scope":"global","text":"My name is Mahbub","source":"manual","importance":0.9}'
+
+# search memory
+curl -X POST http://127.0.0.1:8000/memory/search \
+  -H "content-type: application/json" \
+  -d '{"memory_scope":"global","query":"what is my name?","limit":5}'
+
+# list memory items
+curl "http://127.0.0.1:8000/memory/items?memory_scope=global&limit=20"
+
+# reindex scope from SQLite -> FAISS
+curl -X POST http://127.0.0.1:8000/memory/reindex \
+  -H "content-type: application/json" \
+  -d '{"memory_scope":"global"}'
 ```
 
 ## Common errors

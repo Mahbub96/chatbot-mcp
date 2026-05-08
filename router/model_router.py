@@ -9,17 +9,38 @@ def contains_bangla_text(text: str) -> bool:
     # Bengali & Assamese Unicode block: U+0980..U+09FF
     return any("\u0980" <= ch <= "\u09FF" for ch in text)
 
+
+def _iter_text_parts(content: Any):
+    if isinstance(content, str):
+        yield content
+        return
+    if not isinstance(content, list):
+        return
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") != "text":
+            continue
+        text = part.get("text")
+        if isinstance(text, str):
+            yield text
+
+
 def has_image(messages: list[dict[str, Any]]) -> bool:
     """
-    Detect whether any message contains multimodal/image content.
-
-    OpenAI-style multimodal messages typically encode content as a list of parts,
-    where one part is an image (e.g., type: 'image_url').
+    Detect whether any message contains an actual image part.
     """
     for msg in messages:
         content = msg.get("content")
-        if isinstance(content, list):
-            return True
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "image_url":
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+                    return True
     return False
 
 
@@ -42,6 +63,19 @@ def contains_code_intent(text: str) -> bool:
     return any(marker in lowered for marker in code_markers)
 
 
+def _latest_user_text(messages: list[dict[str, Any]]) -> str:
+    chunks: list[str] = []
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        for text in _iter_text_parts(msg.get("content")):
+            if text.strip():
+                chunks.append(text)
+        if chunks:
+            return "\n".join(chunks)
+    return ""
+
+
 def pick_upstream_model(
     messages: list[dict[str, Any]],
     *,
@@ -60,23 +94,17 @@ def pick_upstream_model(
     if vision_model and has_image(messages):
         return vision_model
 
+    latest_user_text = _latest_user_text(messages)
+
     if code_model:
-        for msg in reversed(messages):
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content")
-            if isinstance(content, str) and contains_code_intent(content):
-                return code_model
+        if contains_code_intent(latest_user_text):
+            return code_model
 
     if not bangla_model:
         return default_model
 
-    for msg in reversed(messages):
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str) and contains_bangla_text(content):
-            return bangla_model
+    if contains_bangla_text(latest_user_text):
+        return bangla_model
 
     return default_model
 
