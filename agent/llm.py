@@ -31,9 +31,9 @@ class LLMClient:
     # =========================
     # STREAMING CORE
     # =========================
-    async def stream(self, messages):
+    async def stream(self, messages, model: str | None = None):
         payload = {
-            "model": MODEL,
+            "model": model or MODEL,
             "messages": messages,
             "stream": True,
             "temperature": 0.7,
@@ -118,6 +118,22 @@ llm_client = LLMClient()
 # =========================
 # PUBLIC STREAM API
 # =========================
-async def stream_llm(messages):
-    async for token in llm_client.stream(messages):
+async def stream_llm(messages, model: str | None = None):
+    async for token in llm_client.stream(messages, model=model):
         yield token
+
+
+async def complete_llm(messages, model: str | None = None) -> str:
+    """
+    Collect streaming tokens into a single completion string.
+    Keeps gateway logic simple and prevents hanging on upstream errors.
+    """
+    chunks: list[str] = []
+    async for token in stream_llm(messages, model=model):
+        if not token:
+            continue
+        # If upstream returns an error marker, fail fast.
+        if token.startswith("[LLM_ERROR") or token.startswith("[NETWORK_ERROR]") or token.startswith("[LLM_EXCEPTION]"):
+            raise RuntimeError(token)
+        chunks.append(token)
+    return "".join(chunks)

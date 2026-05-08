@@ -1,15 +1,17 @@
 import inspect
-import logging
 import importlib
 import pkgutil
 from pathlib import Path
+from typing import Any, Callable
 
-logging.basicConfig(level=logging.INFO)
+import logging
+
+logger = logging.getLogger(__name__)
 
 # =========================
 # TOOL STORE
 # =========================
-TOOLS = {}
+TOOLS: dict[str, Callable[..., Any]] = {}
 
 
 # =========================
@@ -35,7 +37,7 @@ def load_tools():
 
         if hasattr(module, "tool_name") and hasattr(module, "run"):
             TOOLS[module.tool_name] = module.run
-            logging.info(f"[TOOL LOADED] {module.tool_name}")
+            logger.info("[TOOL LOADED] %s", module.tool_name)
 
 
 # load at import time
@@ -68,13 +70,22 @@ def run_tool(name: str, args: dict):
     try:
         sig = inspect.signature(tool)
 
+        has_varkw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+
         # -------------------------
         # REQUIRED PARAM CHECK
         # -------------------------
         missing = [
             p_name
             for p_name, p in sig.parameters.items()
-            if p.default == inspect._empty and p_name not in args
+            if (
+                p.kind != inspect.Parameter.VAR_KEYWORD
+                and p.default == inspect._empty
+                and p_name not in args
+            )
         ]
 
         if missing:
@@ -85,14 +96,16 @@ def run_tool(name: str, args: dict):
             }
 
         # -------------------------
-        # STRICT FILTER (NO EXTRA ARGS)
+        # ARG FILTERING
         # -------------------------
-        filtered_args = {
-            k: v for k, v in args.items()
-            if k in sig.parameters
-        }
+        # If the tool accepts **kwargs, pass args through unfiltered.
+        # Otherwise, keep only explicitly declared parameters.
+        if has_varkw:
+            filtered_args = args
+        else:
+            filtered_args = {k: v for k, v in args.items() if k in sig.parameters}
 
-        logging.info(f"[TOOL] {name} | args={filtered_args}")
+        logger.info("[TOOL] %s | args=%s", name, filtered_args)
 
         result = tool(**filtered_args)
 
@@ -104,7 +117,7 @@ def run_tool(name: str, args: dict):
         }
 
     except Exception as e:
-        logging.exception(f"[TOOL ERROR] {name}")
+        logger.exception("[TOOL ERROR] %s", name)
 
         return {
             "success": False,

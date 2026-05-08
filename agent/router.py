@@ -1,19 +1,36 @@
-def route_task(task_type: str):
-    if task_type == "chat":
-        return "gemini"
-    elif task_type == "code":
-        return "deepseek_or_coder_model"
-    elif task_type == "image":
-        return "image_model"
-    else:
-        return "fast_llm"
+from __future__ import annotations
 
-def route_from_messages(messages):
-    last = messages[-1]["content"]
+from typing import Any
 
-    if "def " in last or "code" in last:
+
+def route_task(task_type: str) -> str:
+    """
+    Placeholder router for future task-based model routing.
+
+    This repo's primary routing lives in `router/` (gateway routing).
+    Keep this function deterministic and side-effect free.
+    """
+    task_type = (task_type or "").lower().strip()
+    if task_type in {"code", "coding"}:
         return "code"
-    elif "image" in last:
+    if task_type in {"image", "vision"}:
         return "image"
-    else:
+    return "chat"
+
+
+def route_from_messages(messages: list[dict[str, Any]]) -> str:
+    """
+    Minimal heuristic for choosing a task type from the last user message.
+    """
+    if not messages:
         return "chat"
+    last = messages[-1].get("content", "")
+    if not isinstance(last, str):
+        return "chat"
+
+    lowered = last.lower()
+    if "```" in lowered or "def " in lowered or "class " in lowered:
+        return "code"
+    if "image" in lowered:
+        return "image"
+    return "chat"

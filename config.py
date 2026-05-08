@@ -16,7 +16,9 @@ def get_env(key: str, required: bool = True):
 
 
 # LLM CONFIG
-MODEL = "meta/llama-3.1-70b-instruct"
+MODEL = os.getenv("DEFAULT_MODEL") or "meta/llama-3.1-70b-instruct"
+BANGLA_MODEL = os.getenv("BANGLA_MODEL") or ""
+VISION_MODEL = os.getenv("VISION_MODEL") or ""
 BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 
