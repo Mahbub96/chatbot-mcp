@@ -32,6 +32,11 @@ MEMORY_TOP_K = int(os.getenv("MEMORY_TOP_K") or "5")
 MEMORY_MIN_SCORE = float(os.getenv("MEMORY_MIN_SCORE") or "0.20")
 MEMORY_AUTO_STORE = (os.getenv("MEMORY_AUTO_STORE") or "true").strip().lower() in {"1", "true", "yes", "on"}
 MEMORY_MAX_ITEMS = int(os.getenv("MEMORY_MAX_ITEMS") or "5000")
+HUMANIZE_RESPONSES = (os.getenv("HUMANIZE_RESPONSES") or "true").strip().lower() in {"1", "true", "yes", "on"}
+HUMAN_TONE_INSTRUCTION = (
+    os.getenv("HUMAN_TONE_INSTRUCTION")
+    or "Respond in a natural, warm, and human tone. Be clear, concise, and conversational."
+)
 
 
 def get_nvidia_api_key():

@@ -70,3 +70,16 @@ class MemoryRepository:
     def count(self, *, memory_scope: str) -> int:
         return len(self.list(memory_scope=memory_scope, limit=100000, offset=0))
 
+    def list_all(self, *, limit: int = 500, offset: int = 0) -> list[MemoryRecord]:
+        with self._session_factory() as session:
+            return (
+                session.execute(
+                    select(MemoryRecord)
+                    .order_by(MemoryRecord.created_at.desc())
+                    .offset(max(0, offset))
+                    .limit(max(1, min(5000, limit)))
+                )
+                .scalars()
+                .all()
+            )
+

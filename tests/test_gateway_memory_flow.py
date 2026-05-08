@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -43,6 +44,33 @@ class GatewayMemoryFlowTest(unittest.TestCase):
         del_res = self.client.delete(f"/memory/items/{item_id}?memory_scope={self.scope}")
         self.assertEqual(del_res.status_code, 200)
         self.assertTrue(del_res.json().get("success"))
+
+    def test_image_chat_generic_refusal_is_rewritten(self):
+        async def fake_complete(_messages, model=None):
+            return "I'm not able to provide help with this conversation."
+
+        with patch("gateway.controllers.chat_controller.complete_llm", fake_complete):
+            res = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "stream": False,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "explain this image"},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "https://example.com/demo.png"},
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        content = res.json()["choices"][0]["message"]["content"]
+        self.assertIn("couldn't analyze the image", content.lower())
 
 
 if __name__ == "__main__":
