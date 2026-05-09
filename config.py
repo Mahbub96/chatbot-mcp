@@ -20,6 +20,11 @@ MODEL = os.getenv("DEFAULT_MODEL") or "meta/llama-3.1-70b-instruct"
 BANGLA_MODEL = os.getenv("BANGLA_MODEL") or ""
 CODE_MODEL = os.getenv("CODE_MODEL") or ""
 VISION_MODEL = os.getenv("VISION_MODEL") or ""
+VISION_FALLBACK_MODELS = tuple(
+    model.strip()
+    for model in (os.getenv("VISION_FALLBACK_MODELS") or "").split(",")
+    if model.strip()
+)
 IMAGE_GEN_MODEL = os.getenv("IMAGE_GEN_MODEL") or "qwen/qwen-image"
 IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL") or "qwen/qwen-image-edit"
 BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"

@@ -63,43 +63,74 @@ class ChatPersonalFallbackTest(unittest.TestCase):
         self.assertIn("Processing image...", body)
         self.assertIn("Image looks good.", body)
 
-    def test_rejects_inline_base64_image_url(self):
-        res = self.client.post(
-            "/v1/chat/completions",
-            json={
-                "stream": False,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "describe"},
-                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-                        ],
-                    }
-                ],
-            },
-        )
-        self.assertEqual(res.status_code, 400)
-        self.assertIn("inline base64", res.text)
+    def test_allows_inline_base64_image_url(self):
+        async def fake_complete(_messages, model=None):
+            return "Inline image accepted."
 
-    def test_rejects_private_image_url(self):
-        res = self.client.post(
-            "/v1/chat/completions",
-            json={
-                "stream": False,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "describe"},
-                            {"type": "image_url", "image_url": {"url": "http://127.0.0.1:9000/demo.png"}},
-                        ],
-                    }
-                ],
-            },
-        )
-        self.assertEqual(res.status_code, 400)
-        self.assertIn("private/local", res.text)
+        with patch("gateway.controllers.chat_controller.complete_llm", fake_complete):
+            res = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "stream": False,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe"},
+                                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                            ],
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("Inline image accepted.", res.text)
+
+    def test_allows_private_localhost_image_url(self):
+        async def fake_complete(_messages, model=None):
+            return "Local URL accepted."
+
+        with patch("gateway.controllers.chat_controller.complete_llm", fake_complete):
+            res = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "stream": False,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe"},
+                                {"type": "image_url", "image_url": {"url": "http://127.0.0.1:9000/demo.png"}},
+                            ],
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("Local URL accepted.", res.text)
+
+    def test_allows_file_scheme_image_url(self):
+        async def fake_complete(_messages, model=None):
+            return "File URL accepted."
+
+        with patch("gateway.controllers.chat_controller.complete_llm", fake_complete):
+            res = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "stream": False,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe"},
+                                {"type": "image_url", "image_url": {"url": "file:///tmp/demo.png"}},
+                            ],
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("File URL accepted.", res.text)
 
 
 if __name__ == "__main__":

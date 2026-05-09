@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import time
 import uuid
-from urllib.parse import urlparse
+from pathlib import Path
+from urllib.parse import urlparse, unquote
 from typing import Any
 
+import httpx
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
@@ -21,6 +25,7 @@ from config import (
     RATE_LIMIT_WINDOW_SECONDS,
     SHADOW_MONITOR_ENABLED,
     VISION_STREAM_TIMEOUT_SECONDS,
+    VISION_FALLBACK_MODELS,
     VISION_MODEL,
 )
 from gateway.controllers.tool_controller import execute_tool_with_policy
@@ -82,6 +87,7 @@ rate_limiter = InMemoryRateLimiter(
 BANGLA_MODEL_COOLDOWN_SECONDS = 300
 FAST_BANGLA_FALLBACK_MODEL = "meta/llama-3.1-8b-instruct"
 _model_unavailable_until: dict[str, float] = {}
+MAX_VISION_IMAGE_BYTES = 5 * 1024 * 1024
 
 
 def is_generic_image_refusal(text: str) -> bool:
@@ -100,35 +106,85 @@ def build_image_refusal_diagnostic(model: str) -> str:
     return (
         "I couldn't analyze the image with the current vision path. "
         f"Selected model: {model}. "
-        "Please retry with a publicly reachable image URL (not private/local/base64) "
-        "and include a short text prompt about what you want explained."
+        "Please retry and include a short text prompt about what you want explained."
     )
 
 
-def find_unsupported_image_input(messages: list[dict[str, Any]]) -> str | None:
+def find_unsupported_image_input(_messages: list[dict[str, Any]]) -> str | None:
+    # Accept all image URL styles:
+    # - data:image/... base64
+    # - file://...
+    # - localhost/private LAN URLs
+    # Upstream/model may still reject unsupported forms, but gateway won't pre-block them.
+    return None
+
+
+async def _fetch_image_bytes_from_url(url: str) -> tuple[bytes, str]:
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme == "file":
+        file_path = Path(unquote(parsed.path or "")).expanduser()
+        if not file_path.exists() or not file_path.is_file():
+            raise RuntimeError(f"file_not_found:{file_path}")
+        data = await asyncio.to_thread(file_path.read_bytes)
+        mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+        return data, mime
+    if scheme in {"http", "https"}:
+        timeout = httpx.Timeout(connect=10.0, read=30.0, write=20.0, pool=10.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            res = await client.get(url)
+            if res.status_code != 200:
+                raise RuntimeError(f"http_fetch_failed:{res.status_code}")
+            content_type = str(res.headers.get("content-type") or "").split(";")[0].strip().lower()
+            mime = content_type or "application/octet-stream"
+            return bytes(res.content), mime
+    raise RuntimeError(f"unsupported_image_scheme:{scheme or 'none'}")
+
+
+async def _materialize_image_urls_to_data_urls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not has_multimodal(messages):
+        return messages
+    normalized: list[dict[str, Any]] = []
     for msg in messages:
         if not isinstance(msg, dict):
+            normalized.append(msg)
             continue
         content = msg.get("content")
         if not isinstance(content, list):
+            normalized.append(msg)
             continue
+        next_parts: list[Any] = []
         for part in content:
             if not isinstance(part, dict) or part.get("type") != "image_url":
+                next_parts.append(part)
                 continue
             image_obj = part.get("image_url") or {}
             if not isinstance(image_obj, dict):
+                next_parts.append(part)
                 continue
-            image_url = str(image_obj.get("url") or "").strip()
-            if not image_url:
+            raw_url = str(image_obj.get("url") or "").strip()
+            if not raw_url or raw_url.lower().startswith("data:image/"):
+                next_parts.append(part)
                 continue
-            lowered = image_url.lower()
-            if lowered.startswith("data:image/"):
-                return "inline-base64"
-            parsed = urlparse(image_url)
-            host = (parsed.hostname or "").lower()
-            if host in {"localhost", "127.0.0.1", "0.0.0.0"} or host.startswith("192.168.") or host.startswith("10.") or host.endswith(".local"):
-                return "private-url"
-    return None
+            try:
+                data, mime = await _fetch_image_bytes_from_url(raw_url)
+                if len(data) > MAX_VISION_IMAGE_BYTES:
+                    raise RuntimeError(f"image_too_large:{len(data)}")
+                b64 = base64.b64encode(data).decode("ascii")
+                next_parts.append(
+                    {
+                        **part,
+                        "image_url": {
+                            **image_obj,
+                            "url": f"data:{mime};base64,{b64}",
+                        },
+                    }
+                )
+            except Exception:
+                # Keep original URL if materialization fails; downstream may still handle it.
+                next_parts.append(part)
+        normalized.append({**msg, "content": next_parts})
+    return normalized
 
 
 def is_upstream_error_token(token: str) -> bool:
@@ -155,6 +211,32 @@ def looks_like_missing_personal_info_reply(text: str) -> bool:
         "i am assuming",
     )
     return any(marker in lowered for marker in markers)
+
+
+def is_openwebui_followup_task_prompt(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    return (
+        "### task:" in lowered
+        and "<chat_history>" in lowered
+        and "follow_ups" in lowered
+        and "json format" in lowered
+    )
+
+
+def build_openwebui_followup_task_response() -> str:
+    # Keep strict JSON shape expected by OpenWebUI task parser.
+    return json.dumps(
+        {
+            "follow_ups": [
+                "Can you describe the key objects in this image?",
+                "What details should I pay attention to in this image?",
+                "Can you summarize this image in one sentence?",
+            ]
+        },
+        ensure_ascii=True,
+    )
 
 
 def infer_retrieval_method(retrieved_items: list[dict[str, Any]]) -> str:
@@ -269,14 +351,52 @@ async def persist_turn_memory(
 
 def normalize_chat_error(exc: Exception, *, had_image_input: bool, model: str) -> str:
     msg = str(exc)
+    if had_image_input and "vision_all_models_failed" in msg:
+        return (
+            "Vision request failed across all configured models. "
+            f"Primary model: {model}. "
+            f"Details: {msg}"
+        )
     if had_image_input and "[LLM_ERROR 500]" in msg:
         return (
             "Vision request failed on upstream model. "
             f"Configured model: {model}. "
-            "Use a publicly reachable image URL (not base64) and verify "
-            "that this model supports image understanding in your NVIDIA account."
+            "Verify that this model supports your provided image input format "
+            "(base64, file URL, localhost/private URL, or public URL) in your NVIDIA account."
         )
     return msg
+
+
+def _vision_model_candidates(primary_model: str) -> list[str]:
+    candidates: list[str] = []
+    for model in [primary_model, *list(VISION_FALLBACK_MODELS)]:
+        normalized = str(model or "").strip()
+        if not normalized or normalized in candidates:
+            continue
+        candidates.append(normalized)
+    return candidates or [primary_model]
+
+
+async def _complete_vision_with_fallback(
+    *,
+    messages: list[dict[str, Any]],
+    primary_model: str,
+) -> tuple[str, str]:
+    errors: list[str] = []
+    for model in _vision_model_candidates(primary_model):
+        try:
+            output = await complete_llm(messages, model=model)
+            if not output:
+                errors.append(f"{model}: empty_output")
+                continue
+            if is_generic_image_refusal(output):
+                errors.append(f"{model}: generic_refusal")
+                continue
+            return output, model
+        except Exception as exc:
+            errors.append(f"{model}: {str(exc)}")
+            continue
+    raise RuntimeError("vision_all_models_failed | " + " || ".join(errors))
 
 
 def should_fallback_bangla_model(upstream_model: str, error_text: str) -> bool:
@@ -338,11 +458,26 @@ async def handle_chat_completions(request: Request) -> Any:
     messages, stream = parse_completion_request(body)
     if not messages:
         return json_error(400, "messages must be a non-empty array")
+    if has_multimodal(messages):
+        messages = await _materialize_image_urls_to_data_urls(messages)
     memory_scope = resolve_memory_scope(request, body)
     llm_messages = messages
     user_text = latest_user_text(messages)
     query_matched_memories: list[dict[str, Any]] = []
     retrieval_trace_items: list[dict[str, Any]] = []
+
+    if is_openwebui_followup_task_prompt(user_text):
+        followup_json = build_openwebui_followup_task_response()
+        if not stream:
+            return build_non_stream_response(followup_json)
+
+        async def followup_stream():
+            yield ":\n\n"
+            yield sse_data(build_chunk_payload(chunk_id="followups", delta_content=followup_json))
+            yield sse_data(build_chunk_payload(chunk_id="followups", finish_reason="stop"))
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(followup_stream(), media_type="text/event-stream")
 
     if user_disputes_identity(user_text):
         dispute_answer = build_identity_dispute_answer()
@@ -432,17 +567,7 @@ async def handle_chat_completions(request: Request) -> Any:
 
     if has_multimodal(llm_messages) and not VISION_MODEL:
         return json_error(400, "Image input detected but VISION_MODEL is not configured. Set VISION_MODEL to a vision-capable NVIDIA NIM model id.")
-    unsupported_image_input = find_unsupported_image_input(llm_messages) if has_multimodal(llm_messages) else None
-    if unsupported_image_input == "inline-base64":
-        return json_error(
-            400,
-            "Image input uses inline base64 data URL. This vision path requires an http/https public image URL.",
-        )
-    if unsupported_image_input == "private-url":
-        return json_error(
-            400,
-            "Image input URL is private/local. Please provide a publicly reachable image URL.",
-        )
+    _ = find_unsupported_image_input(llm_messages) if has_multimodal(llm_messages) else None
 
     selected_model = pick_upstream_model(llm_messages, default_model=DEFAULT_UPSTREAM_MODEL, bangla_model=BANGLA_MODEL, code_model=CODE_MODEL or None, vision_model=VISION_MODEL or None)
     upstream_model = choose_runtime_model(selected_model)
@@ -593,9 +718,13 @@ async def handle_chat_completions(request: Request) -> Any:
 
     if not stream:
         try:
-            text = await complete_llm(llm_messages, model=upstream_model)
-            if has_multimodal(llm_messages) and is_generic_image_refusal(text):
-                text = build_image_refusal_diagnostic(upstream_model)
+            if has_multimodal(llm_messages):
+                text, upstream_model = await _complete_vision_with_fallback(
+                    messages=llm_messages,
+                    primary_model=upstream_model,
+                )
+            else:
+                text = await complete_llm(llm_messages, model=upstream_model)
             if (
                 MEMORY_ENABLED
                 and user_text
@@ -679,37 +808,17 @@ async def handle_chat_completions(request: Request) -> Any:
         if tool_prefix:
             yield sse_data(build_chunk_payload(chunk_id="tool", delta_content=tool_prefix))
         if is_vision_request:
-            # Send one visible status line for UX, then keep alive silently.
-            yield sse_data(build_chunk_payload(chunk_id="vision-status", delta_content="Processing image..."))
-            # Keep stream alive with SSE comments while upstream vision runs.
-            # Comments are not rendered as assistant text by clients.
-            yield ":\n\n"
+            active_vision_model = upstream_model
             try:
                 timeout_s = float(max(8, VISION_STREAM_TIMEOUT_SECONDS))
-                heartbeat_s = 5.0
-                elapsed_s = 0.0
-                task = asyncio.create_task(complete_llm(llm_messages, model=upstream_model))
-                while not task.done():
-                    wait_s = min(heartbeat_s, max(0.1, timeout_s - elapsed_s))
-                    await asyncio.wait({task}, timeout=wait_s)
-                    if task.done():
-                        break
-                    elapsed_s += wait_s
-                    if elapsed_s >= timeout_s:
-                        task.cancel()
-                        yield sse_data(
-                            build_chunk_payload(
-                                chunk_id="error",
-                                delta_content="[ERROR] Image analysis is taking too long. Please retry with a smaller/public image URL.",
-                                finish_reason="stop",
-                            )
-                        )
-                        yield "data: [DONE]\n\n"
-                        return
-                    yield ":\n\n"
-                vision_text = await task
-                if is_generic_image_refusal(vision_text):
-                    vision_text = build_image_refusal_diagnostic(upstream_model)
+                vision_text, used_vision_model = await asyncio.wait_for(
+                    _complete_vision_with_fallback(
+                        messages=llm_messages,
+                        primary_model=active_vision_model,
+                    ),
+                    timeout=timeout_s,
+                )
+                active_vision_model = used_vision_model
                 if vision_text:
                     yield sse_data(build_chunk_payload(chunk_id="chatcmpl-local", delta_content=vision_text))
                 if MEMORY_ENABLED and user_text and vision_text:
@@ -723,14 +832,24 @@ async def handle_chat_completions(request: Request) -> Any:
                         memory_scope=memory_scope,
                         user_text=user_text,
                         assistant_text=vision_text,
-                        model=upstream_model,
+                        model=active_vision_model,
                         retrieved_items=retrieval_trace_items,
                         had_error=False,
                     )
                 yield "data: [DONE]\n\n"
                 return
+            except asyncio.TimeoutError:
+                yield sse_data(
+                    build_chunk_payload(
+                        chunk_id="error",
+                        delta_content="[ERROR] Image analysis timed out. Please retry.",
+                        finish_reason="stop",
+                    )
+                )
+                yield "data: [DONE]\n\n"
+                return
             except Exception as exc:
-                msg = normalize_chat_error(exc, had_image_input=True, model=upstream_model)
+                msg = normalize_chat_error(exc, had_image_input=True, model=active_vision_model)
                 yield sse_data(build_chunk_payload(chunk_id="error", delta_content=f"[ERROR] {msg}", finish_reason="stop"))
                 yield "data: [DONE]\n\n"
                 return
