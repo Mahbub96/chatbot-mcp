@@ -1,17 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import base64
+import contextlib
 import json
 import logging
-import mimetypes
 import time
 import uuid
-from pathlib import Path
-from urllib.parse import urlparse, unquote
 from typing import Any
 
-import httpx
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
@@ -20,13 +16,19 @@ from config import (
     BANGLA_MODEL,
     CODE_MODEL,
     MEMORY_ENABLED,
+    MAX_VISION_IMAGE_BYTES,
+    MAX_VISION_VIDEO_BYTES,
     MODEL as DEFAULT_UPSTREAM_MODEL,
     RATE_LIMIT_MAX_REQUESTS,
     RATE_LIMIT_WINDOW_SECONDS,
     SHADOW_MONITOR_ENABLED,
+    VISION_PER_MODEL_TIMEOUT_SECONDS,
     VISION_STREAM_TIMEOUT_SECONDS,
     VISION_FALLBACK_MODELS,
+    VISION_SPEED_FIRST,
     VISION_MODEL,
+    VISION_VIDEO_FRAME_INTERVAL_SECONDS,
+    VISION_VIDEO_MAX_FRAMES,
 )
 from gateway.controllers.tool_controller import execute_tool_with_policy
 from gateway.helpers.http_utils import (
@@ -69,11 +71,18 @@ from gateway.helpers.memory_logic import (
 from gateway.helpers.rate_limiter import InMemoryRateLimiter
 from gateway.memory_pipeline import memory_pipeline
 from gateway.memory_metrics import memory_metrics
+from gateway.services.multimodal_materializer import (
+    contains_image_url_part,
+    contains_video_url_part,
+    materialize_multimodal_parts,
+    promote_text_video_links,
+)
 from memory.facade import memory_facade as memory_service
 from router.model_router import pick_upstream_model
 from router.tool_router import maybe_run_legacy_keyword_tool
 
 logger = logging.getLogger(__name__)
+step_logger = logging.getLogger("gateway.steps")
 
 ERR_TOO_MANY_REQUESTS = "Too many requests"
 ERR_INVALID_JSON_BODY = "Invalid JSON body"
@@ -87,7 +96,6 @@ rate_limiter = InMemoryRateLimiter(
 BANGLA_MODEL_COOLDOWN_SECONDS = 300
 FAST_BANGLA_FALLBACK_MODEL = "meta/llama-3.1-8b-instruct"
 _model_unavailable_until: dict[str, float] = {}
-MAX_VISION_IMAGE_BYTES = 5 * 1024 * 1024
 
 
 def is_generic_image_refusal(text: str) -> bool:
@@ -98,6 +106,18 @@ def is_generic_image_refusal(text: str) -> bool:
         "i'm not able to provide help with this conversation",
         "i am not able to provide help with this conversation",
         "can't help with this conversation",
+        "i'm not going to engage in this subject matter",
+        "i am not going to engage in this subject matter",
+        "i can't engage in this subject",
+        "i cannot engage in this subject",
+        "i can’t engage in this subject",
+        "i can't assist with that",
+        "i cannot assist with that",
+        "i can’t assist with that",
+        "i'm unable to help with that",
+        "i am unable to help with that",
+        "i can’t help with that",
+        "i can't help with that",
     )
     return any(marker in lowered for marker in markers)
 
@@ -110,6 +130,74 @@ def build_image_refusal_diagnostic(model: str) -> str:
     )
 
 
+def _ensure_vision_instruction(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Ensure multimodal requests always include an explicit visual-description task.
+    This prevents weak/no-text prompts from triggering generic refusals.
+    """
+    normalized: list[dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            normalized.append(msg)
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            normalized.append(msg)
+            continue
+        has_image = False
+        has_video = False
+        has_text = False
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type") or "").strip().lower()
+            if part_type == "image_url":
+                has_image = True
+            elif part_type == "video_url":
+                has_video = True
+            elif part_type == "text":
+                text = str(part.get("text") or "").strip()
+                if text:
+                    has_text = True
+        if (has_image or has_video) and not has_text:
+            auto_instruction = (
+                "Describe this visual content professionally and precisely. "
+                "List key objects, setting, actions, visible text, colors/style, and notable details. "
+                "If uncertain, clearly label uncertainty."
+            )
+            normalized.append(
+                {
+                    **msg,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": auto_instruction,
+                            "meta": {"gateway_auto_instruction": True},
+                        },
+                        *content,
+                    ],
+                }
+            )
+            continue
+        normalized.append(msg)
+    return normalized
+
+
+def _with_refusal_retry_instruction(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Add a strict follow-up instruction used only when the first vision attempt refused.
+    """
+    retry_instruction = (
+        "You are performing neutral visual analysis only. "
+        "Do not discuss policy or refusal language. "
+        "Describe only what is visible in the provided image/video frames."
+    )
+    return [
+        *messages,
+        {"role": "system", "content": retry_instruction},
+    ]
+
+
 def find_unsupported_image_input(_messages: list[dict[str, Any]]) -> str | None:
     # Accept all image URL styles:
     # - data:image/... base64
@@ -117,74 +205,6 @@ def find_unsupported_image_input(_messages: list[dict[str, Any]]) -> str | None:
     # - localhost/private LAN URLs
     # Upstream/model may still reject unsupported forms, but gateway won't pre-block them.
     return None
-
-
-async def _fetch_image_bytes_from_url(url: str) -> tuple[bytes, str]:
-    parsed = urlparse(url)
-    scheme = (parsed.scheme or "").lower()
-    if scheme == "file":
-        file_path = Path(unquote(parsed.path or "")).expanduser()
-        if not file_path.exists() or not file_path.is_file():
-            raise RuntimeError(f"file_not_found:{file_path}")
-        data = await asyncio.to_thread(file_path.read_bytes)
-        mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-        return data, mime
-    if scheme in {"http", "https"}:
-        timeout = httpx.Timeout(connect=10.0, read=30.0, write=20.0, pool=10.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            res = await client.get(url)
-            if res.status_code != 200:
-                raise RuntimeError(f"http_fetch_failed:{res.status_code}")
-            content_type = str(res.headers.get("content-type") or "").split(";")[0].strip().lower()
-            mime = content_type or "application/octet-stream"
-            return bytes(res.content), mime
-    raise RuntimeError(f"unsupported_image_scheme:{scheme or 'none'}")
-
-
-async def _materialize_image_urls_to_data_urls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not has_multimodal(messages):
-        return messages
-    normalized: list[dict[str, Any]] = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            normalized.append(msg)
-            continue
-        content = msg.get("content")
-        if not isinstance(content, list):
-            normalized.append(msg)
-            continue
-        next_parts: list[Any] = []
-        for part in content:
-            if not isinstance(part, dict) or part.get("type") != "image_url":
-                next_parts.append(part)
-                continue
-            image_obj = part.get("image_url") or {}
-            if not isinstance(image_obj, dict):
-                next_parts.append(part)
-                continue
-            raw_url = str(image_obj.get("url") or "").strip()
-            if not raw_url or raw_url.lower().startswith("data:image/"):
-                next_parts.append(part)
-                continue
-            try:
-                data, mime = await _fetch_image_bytes_from_url(raw_url)
-                if len(data) > MAX_VISION_IMAGE_BYTES:
-                    raise RuntimeError(f"image_too_large:{len(data)}")
-                b64 = base64.b64encode(data).decode("ascii")
-                next_parts.append(
-                    {
-                        **part,
-                        "image_url": {
-                            **image_obj,
-                            "url": f"data:{mime};base64,{b64}",
-                        },
-                    }
-                )
-            except Exception:
-                # Keep original URL if materialization fails; downstream may still handle it.
-                next_parts.append(part)
-        normalized.append({**msg, "content": next_parts})
-    return normalized
 
 
 def is_upstream_error_token(token: str) -> bool:
@@ -369,7 +389,12 @@ def normalize_chat_error(exc: Exception, *, had_image_input: bool, model: str) -
 
 def _vision_model_candidates(primary_model: str) -> list[str]:
     candidates: list[str] = []
-    for model in [primary_model, *list(VISION_FALLBACK_MODELS)]:
+    ordered = (
+        [*list(VISION_FALLBACK_MODELS), primary_model]
+        if VISION_SPEED_FIRST and VISION_FALLBACK_MODELS
+        else [primary_model, *list(VISION_FALLBACK_MODELS)]
+    )
+    for model in ordered:
         normalized = str(model or "").strip()
         if not normalized or normalized in candidates:
             continue
@@ -381,19 +406,49 @@ async def _complete_vision_with_fallback(
     *,
     messages: list[dict[str, Any]],
     primary_model: str,
+    on_step: Any | None = None,
 ) -> tuple[str, str]:
+    def _emit(step_name: str) -> None:
+        if callable(on_step):
+            try:
+                on_step(step_name)
+            except Exception:
+                return
+
     errors: list[str] = []
     for model in _vision_model_candidates(primary_model):
         try:
-            output = await complete_llm(messages, model=model)
+            _emit(f"vision_model_attempt.start[{model}]")
+            output = await asyncio.wait_for(
+                complete_llm(messages, model=model),
+                timeout=float(max(5, VISION_PER_MODEL_TIMEOUT_SECONDS)),
+            )
             if not output:
+                _emit(f"vision_model_attempt.empty_output[{model}]")
                 errors.append(f"{model}: empty_output")
                 continue
             if is_generic_image_refusal(output):
+                _emit(f"vision_model_attempt.generic_refusal[{model}]")
+                retry_messages = _with_refusal_retry_instruction(messages)
+                _emit(f"vision_model_attempt.retry.start[{model}]")
+                retry_output = await asyncio.wait_for(
+                    complete_llm(retry_messages, model=model),
+                    timeout=float(max(5, VISION_PER_MODEL_TIMEOUT_SECONDS)),
+                )
+                if retry_output and not is_generic_image_refusal(retry_output):
+                    _emit(f"vision_model_attempt.retry.success[{model}]")
+                    return retry_output, model
+                _emit(f"vision_model_attempt.retry.failed[{model}]")
                 errors.append(f"{model}: generic_refusal")
                 continue
+            _emit(f"vision_model_attempt.success[{model}]")
             return output, model
+        except asyncio.TimeoutError:
+            _emit(f"vision_model_attempt.timeout[{model}]")
+            errors.append(f"{model}: per_model_timeout")
+            continue
         except Exception as exc:
+            _emit(f"vision_model_attempt.error[{model}]")
             errors.append(f"{model}: {str(exc)}")
             continue
     raise RuntimeError("vision_all_models_failed | " + " || ".join(errors))
@@ -444,31 +499,75 @@ def bangla_fallback_model() -> str:
 
 
 async def handle_chat_completions(request: Request) -> Any:
+    request_started_at = time.perf_counter()
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    step_counter = 0
+    previous_elapsed_ms = 0
+
+    def log_step(function_name: str) -> None:
+        nonlocal step_counter, previous_elapsed_ms
+        step_counter += 1
+        elapsed_ms = int((time.perf_counter() - request_started_at) * 1000)
+        delta_ms = elapsed_ms - previous_elapsed_ms
+        previous_elapsed_ms = elapsed_ms
+        message = f"req={request_id} step {step_counter} : {function_name} | +{elapsed_ms}ms | delta={delta_ms}ms"
+        logger.info(message)
+        if step_logger.handlers:
+            step_logger.info(message)
+
+    log_step("handle_chat_completions.start")
     client_ip = request.client.host if request.client else "unknown"
+    log_step("rate_limiter.is_limited")
     if rate_limiter.is_limited(client_ip):
+        log_step("json_error.too_many_requests")
         return json_error(429, ERR_TOO_MANY_REQUESTS)
     try:
+        log_step("request.json")
         body = await request.json()
     except Exception:
+        log_step("json_error.invalid_json_body")
         return json_error(400, ERR_INVALID_JSON_BODY)
     if not isinstance(body, dict):
+        log_step("json_error.body_object_required")
         return json_error(400, ERR_BODY_OBJECT_REQUIRED)
 
+    log_step("parse_completion_request")
     messages, stream = parse_completion_request(body)
+    log_step("promote_text_video_links")
+    messages = promote_text_video_links(messages)
     if not messages:
+        log_step("json_error.messages_empty")
         return json_error(400, "messages must be a non-empty array")
     if has_multimodal(messages):
-        messages = await _materialize_image_urls_to_data_urls(messages)
+        log_step("materialize_multimodal_parts")
+        messages = await materialize_multimodal_parts(
+            messages,
+            max_image_bytes=MAX_VISION_IMAGE_BYTES,
+            max_video_bytes=MAX_VISION_VIDEO_BYTES,
+            max_video_frames=VISION_VIDEO_MAX_FRAMES,
+            video_frame_interval_seconds=VISION_VIDEO_FRAME_INTERVAL_SECONDS,
+        )
+        log_step("_ensure_vision_instruction")
+        messages = _ensure_vision_instruction(messages)
+        if contains_video_url_part(messages) and not contains_image_url_part(messages):
+            log_step("json_error.video_decode_failed")
+            return json_error(
+                400,
+                "Video detected but could not decode frames. Share a direct downloadable video URL or upload a smaller video.",
+            )
+    log_step("resolve_memory_scope")
     memory_scope = resolve_memory_scope(request, body)
     llm_messages = messages
+    log_step("latest_user_text")
     user_text = latest_user_text(messages)
     query_matched_memories: list[dict[str, Any]] = []
     retrieval_trace_items: list[dict[str, Any]] = []
 
     if is_openwebui_followup_task_prompt(user_text):
+        log_step("build_openwebui_followup_task_response")
         followup_json = build_openwebui_followup_task_response()
         if not stream:
+            log_step("build_non_stream_response.followups")
             return build_non_stream_response(followup_json)
 
         async def followup_stream():
@@ -480,15 +579,18 @@ async def handle_chat_completions(request: Request) -> Any:
         return StreamingResponse(followup_stream(), media_type="text/event-stream")
 
     if user_disputes_identity(user_text):
+        log_step("build_identity_dispute_answer")
         dispute_answer = build_identity_dispute_answer()
         if not stream:
+            log_step("build_non_stream_response.identity_dispute")
             return build_non_stream_response(dispute_answer)
         async def dispute_stream():
             yield ":\n\n"; yield sse_data(build_chunk_payload(chunk_id="identity-dispute", delta_content=dispute_answer)); yield sse_data(build_chunk_payload(chunk_id="identity-dispute", finish_reason="stop")); yield "data: [DONE]\n\n"
         return StreamingResponse(dispute_stream(), media_type="text/event-stream")
 
-    if MEMORY_ENABLED and user_text:
+    if MEMORY_ENABLED and user_text and not has_multimodal(llm_messages):
         try:
+            log_step("memory_service.retrieve_memory")
             memories = await asyncio.to_thread(
                 memory_service.retrieve_memory,
                 query=user_text,
@@ -566,11 +668,15 @@ async def handle_chat_completions(request: Request) -> Any:
             logger.warning("Memory retrieval failed: %s", exc)
 
     if has_multimodal(llm_messages) and not VISION_MODEL:
+        log_step("json_error.vision_model_not_configured")
         return json_error(400, "Image input detected but VISION_MODEL is not configured. Set VISION_MODEL to a vision-capable NVIDIA NIM model id.")
     _ = find_unsupported_image_input(llm_messages) if has_multimodal(llm_messages) else None
 
+    log_step("pick_upstream_model")
     selected_model = pick_upstream_model(llm_messages, default_model=DEFAULT_UPSTREAM_MODEL, bangla_model=BANGLA_MODEL, code_model=CODE_MODEL or None, vision_model=VISION_MODEL or None)
+    log_step("choose_runtime_model")
     upstream_model = choose_runtime_model(selected_model)
+    log_step("maybe_run_legacy_keyword_tool")
     tool_output = maybe_run_legacy_keyword_tool(
         llm_messages,
         tool_runner=lambda n, a: execute_tool_with_policy(n, a, approval_id=None),
@@ -579,6 +685,7 @@ async def handle_chat_completions(request: Request) -> Any:
     tool_prefix = f"\n[TOOL RESULT]\n{json.dumps(tool_output)}\n" if tool_output is not None else ""
     if tool_output is not None and tool_output.get("requires_approval") is True:
         if not stream:
+            log_step("build_non_stream_response.tool_approval")
             return build_non_stream_response(tool_prefix)
 
         async def approval_only_stream():
@@ -647,6 +754,7 @@ async def handle_chat_completions(request: Request) -> Any:
             else "I received your structured text, but memory persistence failed. Please retry and I will save it."
         )
         if not stream:
+            log_step("build_non_stream_response.doc_ingest")
             return build_non_stream_response(tool_prefix + ingest_ack)
 
         async def ingest_ack_stream():
@@ -673,13 +781,17 @@ async def handle_chat_completions(request: Request) -> Any:
                 if len(merged) >= 300:
                     break
             local_memories = merged
+        log_step("build_non_stream_response.user_profile_summary")
         return build_non_stream_response(tool_prefix + build_user_profile_summary(local_memories))
     if MEMORY_ENABLED and user_text and is_exact_shared_request(user_text) and not has_multimodal(llm_messages):
         best = pick_best_shared_memory(memory_service.list_profile_memories_any_scope(limit=400))
+        log_step("build_non_stream_response.exact_shared")
         return build_non_stream_response(tool_prefix + (build_exact_shared_response(best) if best else "I couldn't find an exact shared item in local memory."))
     if MEMORY_ENABLED and user_text and is_shared_summary_request(user_text) and not has_multimodal(llm_messages):
+        log_step("build_non_stream_response.shared_summary")
         return build_non_stream_response(tool_prefix + build_shared_summary_response(memory_service.list_profile_memories_any_scope(limit=400)))
     if user_text and is_offer_intent_query(user_text) and not has_multimodal(llm_messages):
+        log_step("build_non_stream_response.offer_intent")
         return build_non_stream_response(tool_prefix + build_offer_intent_answer())
 
     if MEMORY_ENABLED and user_text and is_cv_query(user_text) and not has_multimodal(llm_messages):
@@ -704,6 +816,7 @@ async def handle_chat_completions(request: Request) -> Any:
         missing_answer = build_memory_missing_answer(user_text)
         if missing_answer:
             if not stream:
+                log_step("build_non_stream_response.memory_missing")
                 return build_non_stream_response(tool_prefix + missing_answer)
 
             async def missing_memory_stream():
@@ -719,11 +832,19 @@ async def handle_chat_completions(request: Request) -> Any:
     if not stream:
         try:
             if has_multimodal(llm_messages):
+                log_step("_complete_vision_with_fallback.non_stream")
+                vision_started_at = time.perf_counter()
                 text, upstream_model = await _complete_vision_with_fallback(
                     messages=llm_messages,
                     primary_model=upstream_model,
                 )
+                logger.info(
+                    "vision_call.non_stream.duration_ms=%s model=%s",
+                    int((time.perf_counter() - vision_started_at) * 1000),
+                    upstream_model,
+                )
             else:
+                log_step("complete_llm.non_stream")
                 text = await complete_llm(llm_messages, model=upstream_model)
             if (
                 MEMORY_ENABLED
@@ -757,11 +878,13 @@ async def handle_chat_completions(request: Request) -> Any:
                 if safe_fallback:
                     text = safe_fallback
             if MEMORY_ENABLED and user_text:
+                log_step("persist_turn_memory.non_stream")
                 await persist_turn_memory(
                     user_text=user_text,
                     assistant_text=text,
                     memory_scope=memory_scope,
                 )
+                log_step("memory_service.log_chat_trace.non_stream")
                 memory_service.log_chat_trace(
                     request_id=request_id,
                     memory_scope=memory_scope,
@@ -771,8 +894,13 @@ async def handle_chat_completions(request: Request) -> Any:
                     retrieved_items=retrieval_trace_items,
                     had_error=False,
                 )
+            log_step("build_non_stream_response.final")
             return build_non_stream_response(tool_prefix + text)
         except Exception as exc:
+            if has_multimodal(llm_messages) and "vision_all_models_failed" in str(exc):
+                diagnostic = build_image_refusal_diagnostic(upstream_model)
+                log_step("build_non_stream_response.vision_diagnostic")
+                return build_non_stream_response(tool_prefix + diagnostic)
             if should_fallback_bangla_model(upstream_model, str(exc)):
                 mark_model_unavailable(BANGLA_MODEL, BANGLA_MODEL_COOLDOWN_SECONDS)
                 text = await complete_llm(llm_messages, model=bangla_fallback_model())
@@ -798,7 +926,9 @@ async def handle_chat_completions(request: Request) -> Any:
                         retrieved_items=retrieval_trace_items,
                         had_error=True,
                     )
+                log_step("build_non_stream_response.fallback_answer")
                 return build_non_stream_response(tool_prefix + fallback_answer)
+            log_step("json_error.upstream_failure")
             return json_error(502, normalize_chat_error(exc, had_image_input=has_multimodal(llm_messages), model=upstream_model))
 
     async def generate():
@@ -810,23 +940,57 @@ async def handle_chat_completions(request: Request) -> Any:
         if is_vision_request:
             active_vision_model = upstream_model
             try:
+                yield f"event: status\ndata: {json.dumps({'message': 'Processing image...'})}\n\n"
                 timeout_s = float(max(8, VISION_STREAM_TIMEOUT_SECONDS))
-                vision_text, used_vision_model = await asyncio.wait_for(
+                log_step("_complete_vision_with_fallback.stream")
+                vision_started_at = time.perf_counter()
+                vision_task = asyncio.create_task(
                     _complete_vision_with_fallback(
                         messages=llm_messages,
                         primary_model=active_vision_model,
-                    ),
-                    timeout=timeout_s,
+                        on_step=log_step,
+                    )
+                )
+                heartbeat_interval_s = 3.0
+                next_heartbeat_at_s = heartbeat_interval_s
+                while True:
+                    elapsed_s = time.perf_counter() - vision_started_at
+                    remaining_s = timeout_s - elapsed_s
+                    if remaining_s <= 0:
+                        vision_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await vision_task
+                        raise asyncio.TimeoutError()
+                    wait_slice_s = min(heartbeat_interval_s, remaining_s)
+                    try:
+                        vision_text, used_vision_model = await asyncio.wait_for(
+                            asyncio.shield(vision_task),
+                            timeout=wait_slice_s,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        elapsed_whole_s = int(time.perf_counter() - vision_started_at)
+                        if elapsed_whole_s >= int(next_heartbeat_at_s):
+                            yield f"event: status\ndata: {json.dumps({'message': f'Still processing image... ({elapsed_whole_s}s)'})}\n\n"
+                            log_step("vision_status_heartbeat_sent")
+                            next_heartbeat_at_s += heartbeat_interval_s
+                        continue
+                logger.info(
+                    "vision_call.stream.duration_ms=%s model=%s",
+                    int((time.perf_counter() - vision_started_at) * 1000),
+                    used_vision_model,
                 )
                 active_vision_model = used_vision_model
                 if vision_text:
                     yield sse_data(build_chunk_payload(chunk_id="chatcmpl-local", delta_content=vision_text))
                 if MEMORY_ENABLED and user_text and vision_text:
+                    log_step("persist_turn_memory.stream_vision")
                     await persist_turn_memory(
                         user_text=user_text,
                         assistant_text=vision_text,
                         memory_scope=memory_scope,
                     )
+                    log_step("memory_service.log_chat_trace.stream_vision")
                     memory_service.log_chat_trace(
                         request_id=request_id,
                         memory_scope=memory_scope,
@@ -836,6 +1000,7 @@ async def handle_chat_completions(request: Request) -> Any:
                         retrieved_items=retrieval_trace_items,
                         had_error=False,
                     )
+                log_step("stream_response.done.vision_success")
                 yield "data: [DONE]\n\n"
                 return
             except asyncio.TimeoutError:
@@ -846,15 +1011,24 @@ async def handle_chat_completions(request: Request) -> Any:
                         finish_reason="stop",
                     )
                 )
+                log_step("stream_response.done.vision_timeout")
                 yield "data: [DONE]\n\n"
                 return
             except Exception as exc:
+                if "vision_all_models_failed" in str(exc):
+                    diagnostic = build_image_refusal_diagnostic(active_vision_model)
+                    yield sse_data(build_chunk_payload(chunk_id="chatcmpl-local", delta_content=diagnostic))
+                    log_step("stream_response.done.vision_all_models_failed")
+                    yield "data: [DONE]\n\n"
+                    return
                 msg = normalize_chat_error(exc, had_image_input=True, model=active_vision_model)
                 yield sse_data(build_chunk_payload(chunk_id="error", delta_content=f"[ERROR] {msg}", finish_reason="stop"))
+                log_step("stream_response.done.vision_error")
                 yield "data: [DONE]\n\n"
                 return
         collected_tokens: list[str] = []
         try:
+            log_step("stream_llm.stream")
             async for token in stream_llm(llm_messages, model=upstream_model):
                 if token:
                     if is_upstream_error_token(token):
@@ -877,6 +1051,7 @@ async def handle_chat_completions(request: Request) -> Any:
                                 model=upstream_model,
                             )
                             yield sse_data(build_chunk_payload(chunk_id="error", delta_content=f"[ERROR] {msg}", finish_reason="stop"))
+                        log_step("stream_response.done.upstream_error_token")
                         yield "data: [DONE]\n\n"
                         return
                     collected_tokens.append(token)
@@ -888,6 +1063,7 @@ async def handle_chat_completions(request: Request) -> Any:
             if fallback_answer and not collected_tokens:
                 yield sse_data(build_chunk_payload(chunk_id="memory-fallback", delta_content=fallback_answer))
                 yield sse_data(build_chunk_payload(chunk_id="memory-fallback", finish_reason="stop"))
+                log_step("stream_response.done.memory_fallback")
                 yield "data: [DONE]\n\n"
                 return
             yield sse_data(build_chunk_payload(chunk_id="error", delta_content=f"[ERROR] {str(exc)}", finish_reason="stop"))
@@ -934,11 +1110,13 @@ async def handle_chat_completions(request: Request) -> Any:
                 final_text = build_image_refusal_diagnostic(upstream_model)
             yield sse_data(build_chunk_payload(chunk_id="chatcmpl-local", delta_content=final_text))
         if MEMORY_ENABLED and user_text and collected_tokens:
+            log_step("persist_turn_memory.stream")
             await persist_turn_memory(
                 user_text=user_text,
                 assistant_text=final_text,
                 memory_scope=memory_scope,
             )
+            log_step("memory_service.log_chat_trace.stream")
             memory_service.log_chat_trace(
                 request_id=request_id,
                 memory_scope=memory_scope,
@@ -948,6 +1126,7 @@ async def handle_chat_completions(request: Request) -> Any:
                 retrieved_items=retrieval_trace_items,
                 had_error=False,
             )
+        log_step("stream_response.done")
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")

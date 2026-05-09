@@ -94,6 +94,11 @@ Tooling:
 - **`RATE_LIMIT_MAX_REQUESTS`**: max requests per client IP within the window.
 - **`LOG_JSON`**: enable structured JSON request logs.
 - **`VISION_STREAM_TIMEOUT_SECONDS`**: max time to wait for vision response in streamed chat before timeout error.
+- **`MAX_VISION_IMAGE_BYTES`**: max image bytes accepted during image URL/data-url normalization.
+- **`MAX_VISION_VIDEO_BYTES`**: max video bytes accepted before frame extraction.
+- **`VISION_VIDEO_MAX_FRAMES`**: max number of video frames sampled per input video.
+- **`VISION_VIDEO_FRAME_INTERVAL_SECONDS`**: spacing in seconds between sampled frames.
+- **`VISION_YTDLP_COOKIES_FROM_BROWSER`**: optional browser profile name for `yt-dlp --cookies-from-browser` (helps with restricted YouTube links).
 
 Use `.env.example` as template:
 
@@ -219,9 +224,10 @@ For image editing, use `/v1/images/edits` with `IMAGE_EDIT_MODEL`.
 ## Image input behavior (important)
 
 - Image explanation in chat is supported through `POST /v1/chat/completions`.
-- The gateway requires publicly reachable `http/https` image URLs.
-- Inline base64 image data URLs and private/local URLs are rejected with clear `400` errors.
+- The gateway accepts `http/https`, `file://`, and base64 data URLs for image inputs.
+- Private/local URLs are allowed by gateway validation, but upstream model/network constraints may still prevent successful fetch/analysis.
 - For stability with some upstream vision models, the gateway uses a non-stream upstream call for image requests and then returns the result to clients (including SSE clients).
+- When the upstream vision path returns generic refusal responses, the gateway rewrites to a clear diagnostic and prompts retry guidance.
 - Image requests can be slower than text-only requests (often much longer first-token latency depending on model/provider load).
 
 ## Approval workflow

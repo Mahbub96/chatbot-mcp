@@ -11,7 +11,7 @@ from config import (
     get_nvidia_api_key,
 )
 
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONNECT_TIMEOUT = 20.0
 DEFAULT_WRITE_TIMEOUT = 20.0
@@ -88,7 +88,7 @@ class LLMClient:
                 res = await self.client.post(BASE_URL, json=payload, timeout=timeout)
                 if res.status_code != 200:
                     error_msg = f"[LLM_ERROR {res.status_code}] {res.text}"
-                    logging.error(error_msg)
+                    logger.error(error_msg)
                     yield error_msg
                     return
                 try:
@@ -104,7 +104,7 @@ class LLMClient:
                     return
                 except Exception as exc:
                     error_msg = f"[LLM_EXCEPTION] Invalid JSON response: {str(exc)}"
-                    logging.error(error_msg)
+                    logger.error(error_msg)
                     yield error_msg
                     return
 
@@ -121,7 +121,7 @@ class LLMClient:
                 if res.status_code != 200:
                     err = await res.aread()
                     error_msg = f"[LLM_ERROR {res.status_code}] {err.decode()}"
-                    logging.error(error_msg)
+                    logger.error(error_msg)
                     yield error_msg
                     return
 
@@ -160,17 +160,17 @@ class LLMClient:
                         continue
 
                     except Exception as e:
-                        logging.warning(f"Stream parse error: {e}")
+                        logger.warning(f"Stream parse error: {e}")
                         continue
 
         except httpx.RequestError as e:
             error_msg = f"[NETWORK_ERROR] {str(e) or repr(e)}"
-            logging.error(error_msg)
+            logger.error(error_msg)
             yield error_msg
 
         except Exception as e:
             error_msg = f"[LLM_EXCEPTION] {str(e)}"
-            logging.error(error_msg)
+            logger.error(error_msg)
             yield error_msg
 
     # =========================

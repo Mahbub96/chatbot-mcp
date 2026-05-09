@@ -25,6 +25,7 @@ VISION_FALLBACK_MODELS = tuple(
     for model in (os.getenv("VISION_FALLBACK_MODELS") or "").split(",")
     if model.strip()
 )
+VISION_SPEED_FIRST = (os.getenv("VISION_SPEED_FIRST") or "false").strip().lower() in {"1", "true", "yes", "on"}
 IMAGE_GEN_MODEL = os.getenv("IMAGE_GEN_MODEL") or "qwen/qwen-image"
 IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL") or "qwen/qwen-image-edit"
 BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -57,7 +58,17 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS") or "100")
 RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS") or "100")
 LOG_JSON = (os.getenv("LOG_JSON") or "true").strip().lower() in {"1", "true", "yes", "on"}
 DEBUG_MODE = (os.getenv("DEBUG_MODE") or "false").strip().lower() in {"1", "true", "yes", "on"}
+DEBUG_LOG_TO_FILE = (os.getenv("DEBUG_LOG_TO_FILE") or "true").strip().lower() in {"1", "true", "yes", "on"}
+DEBUG_LOG_FILE = os.getenv("DEBUG_LOG_FILE") or str(BASE_DIR / "mcp.log")
+STEP_LOG_ENABLED = (os.getenv("STEP_LOG_ENABLED") or "false").strip().lower() in {"1", "true", "yes", "on"}
+STEP_LOG_FILE = os.getenv("STEP_LOG_FILE") or str(BASE_DIR / "step.log")
 VISION_STREAM_TIMEOUT_SECONDS = int(os.getenv("VISION_STREAM_TIMEOUT_SECONDS") or "90")
+VISION_PER_MODEL_TIMEOUT_SECONDS = max(5, int(os.getenv("VISION_PER_MODEL_TIMEOUT_SECONDS") or "30"))
+MAX_VISION_IMAGE_BYTES = max(256 * 1024, int(os.getenv("MAX_VISION_IMAGE_BYTES") or str(5 * 1024 * 1024)))
+MAX_VISION_VIDEO_BYTES = max(1024 * 1024, int(os.getenv("MAX_VISION_VIDEO_BYTES") or str(30 * 1024 * 1024)))
+VISION_VIDEO_MAX_FRAMES = max(1, int(os.getenv("VISION_VIDEO_MAX_FRAMES") or "4"))
+VISION_VIDEO_FRAME_INTERVAL_SECONDS = max(0.25, float(os.getenv("VISION_VIDEO_FRAME_INTERVAL_SECONDS") or "2"))
+VISION_YTDLP_COOKIES_FROM_BROWSER = (os.getenv("VISION_YTDLP_COOKIES_FROM_BROWSER") or "").strip()
 HUMANIZE_RESPONSES = (os.getenv("HUMANIZE_RESPONSES") or "true").strip().lower() in {"1", "true", "yes", "on"}
 HUMAN_TONE_INSTRUCTION = (
     os.getenv("HUMAN_TONE_INSTRUCTION")

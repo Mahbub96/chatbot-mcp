@@ -157,6 +157,10 @@ def latest_user_text(messages: list[dict[str, Any]]) -> str:
             for part in content:
                 if not isinstance(part, dict) or part.get("type") != "text":
                     continue
+                meta = part.get("meta")
+                if isinstance(meta, dict) and bool(meta.get("gateway_auto_instruction")):
+                    # Ignore gateway-injected helper prompts when extracting user text.
+                    continue
                 text = part.get("text")
                 if isinstance(text, str) and text.strip():
                     parts.append(text.strip())

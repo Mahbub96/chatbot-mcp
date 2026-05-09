@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -46,8 +46,7 @@ class GatewayMemoryFlowTest(unittest.TestCase):
         self.assertTrue(del_res.json().get("success"))
 
     def test_image_chat_generic_refusal_is_rewritten(self):
-        async def fake_complete(_messages, model=None):
-            return "I'm not able to provide help with this conversation."
+        fake_complete = AsyncMock(return_value="I'm not able to provide help with this conversation.")
 
         with patch("gateway.controllers.chat_controller.complete_llm", fake_complete):
             res = self.client.post(
@@ -71,6 +70,93 @@ class GatewayMemoryFlowTest(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         content = res.json()["choices"][0]["message"]["content"]
         self.assertIn("couldn't analyze the image", content.lower())
+
+    def test_image_chat_subject_matter_refusal_is_rewritten(self):
+        fake_complete = AsyncMock(return_value="I'm not going to engage in this subject matter.")
+
+        with patch("gateway.controllers.chat_controller.complete_llm", fake_complete):
+            res = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "stream": False,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe this image"},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "https://example.com/demo.png"},
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        content = res.json()["choices"][0]["message"]["content"]
+        self.assertIn("couldn't analyze the image", content.lower())
+
+    def test_image_chat_retries_on_initial_refusal(self):
+        fake_complete = AsyncMock(
+            side_effect=[
+                "I'm not going to engage in this subject matter.",
+                "A dark-themed dashboard UI is shown with glowing circular audio visualizer.",
+            ]
+        )
+
+        with patch("gateway.controllers.chat_controller.complete_llm", fake_complete):
+            res = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "stream": False,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe this image"},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "https://example.com/demo.png"},
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        content = res.json()["choices"][0]["message"]["content"]
+        self.assertIn("dashboard ui", content.lower())
+        self.assertEqual(fake_complete.await_count, 2)
+
+    def test_image_chat_autoinjects_instruction_when_text_missing(self):
+        fake_complete = AsyncMock(return_value="An image with two people and a laptop on a desk.")
+
+        with patch("gateway.controllers.chat_controller.complete_llm", fake_complete):
+            res = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "stream": False,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "https://example.com/demo.png"},
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        self.assertGreaterEqual(fake_complete.await_count, 1)
+        first_messages = fake_complete.await_args_list[0].args[0]
+        first_user = next(msg for msg in first_messages if msg.get("role") == "user")
+        first_part = first_user["content"][0]
+        self.assertEqual(first_part["type"], "text")
+        self.assertIn("describe this visual content professionally", first_part["text"].lower())
 
 
 if __name__ == "__main__":

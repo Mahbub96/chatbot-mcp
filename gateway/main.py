@@ -4,11 +4,19 @@ import json
 import logging
 import time
 import uuid
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from config import DEBUG_MODE, LOG_JSON
+from config import (
+    DEBUG_LOG_FILE,
+    DEBUG_LOG_TO_FILE,
+    DEBUG_MODE,
+    LOG_JSON,
+    STEP_LOG_ENABLED,
+    STEP_LOG_FILE,
+)
 from agent.llm import llm_client
 from memory.facade import memory_facade as memory_service
 from gateway.memory_pipeline import memory_pipeline
@@ -19,16 +27,48 @@ from gateway.routers.mcp_router import router as mcp_router
 from gateway.routers.memory_router import router as memory_router
 from gateway.routers.metrics_router import router as metrics_router
 from gateway.routers.models_router import router as models_router
+from gateway.services.multimodal_materializer import close_multimodal_http_client
 from gateway.telemetry import record_request
 
 app = FastAPI(title="Local MCP Gateway", version="1.0.0")
 logger = logging.getLogger("gateway.http")
+step_logger = logging.getLogger("gateway.steps")
+
+
+def _has_file_handler(logger_obj: logging.Logger, file_path: str) -> bool:
+    resolved = str(Path(file_path).resolve())
+    for handler in logger_obj.handlers:
+        if isinstance(handler, logging.FileHandler):
+            base = getattr(handler, "baseFilename", "")
+            if base and str(Path(base).resolve()) == resolved:
+                return True
+    return False
 
 def _configure_debug_logging() -> None:
     if not DEBUG_MODE:
         return
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
+    if DEBUG_LOG_TO_FILE:
+        log_path = Path(DEBUG_LOG_FILE).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved = str(log_path.resolve())
+        if not _has_file_handler(root, resolved):
+            file_handler = logging.FileHandler(resolved, encoding="utf-8")
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+            root.addHandler(file_handler)
+    if STEP_LOG_ENABLED:
+        step_path = Path(STEP_LOG_FILE).expanduser()
+        step_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_step = str(step_path.resolve())
+        if not _has_file_handler(step_logger, resolved_step):
+            step_handler = logging.FileHandler(resolved_step, encoding="utf-8")
+            step_handler.setLevel(logging.INFO)
+            step_handler.setFormatter(logging.Formatter("%(message)s"))
+            step_logger.addHandler(step_handler)
+        step_logger.setLevel(logging.INFO)
+        step_logger.propagate = False
     for handler in root.handlers:
         handler.setLevel(logging.DEBUG)
     logging.getLogger("uvicorn").setLevel(logging.DEBUG)
@@ -78,6 +118,20 @@ async def shutdown_cleanup():
                     "event": "shutdown_cleanup",
                     "status": "error",
                     "resource": "llm_client",
+                    "error": str(exc),
+                }
+            )
+        )
+    try:
+        await close_multimodal_http_client()
+        logger.info(json.dumps({"event": "shutdown_cleanup", "status": "ok", "resource": "multimodal_http_client"}))
+    except Exception as exc:
+        logger.error(
+            json.dumps(
+                {
+                    "event": "shutdown_cleanup",
+                    "status": "error",
+                    "resource": "multimodal_http_client",
                     "error": str(exc),
                 }
             )
@@ -152,6 +206,47 @@ async def request_context_middleware(request, call_next):
                     }
                 )
             )
+        return response
+    body_iterator = getattr(response, "body_iterator", None)
+    if body_iterator is not None:
+        response.headers["X-Request-Id"] = request_id
+        original_iterator = body_iterator
+
+        async def wrapped_stream():
+            try:
+                async for chunk in original_iterator:
+                    yield chunk
+            finally:
+                elapsed_ms = round((time.perf_counter() - start) * 1000.0, 2)
+                record_request(method=method, path=path, status_code=response.status_code, duration_ms=elapsed_ms)
+                if LOG_JSON:
+                    logger.info(
+                        json.dumps(
+                            {
+                                "event": "http_request",
+                                "request_id": request_id,
+                                "method": method,
+                                "path": path,
+                                "status_code": response.status_code,
+                                "duration_ms": elapsed_ms,
+                            }
+                        )
+                    )
+                if DEBUG_MODE:
+                    logger.debug(
+                        json.dumps(
+                            {
+                                "event": "http_request_end",
+                                "request_id": request_id,
+                                "method": method,
+                                "path": path,
+                                "status_code": response.status_code,
+                                "duration_ms": elapsed_ms,
+                            }
+                        )
+                    )
+
+        response.body_iterator = wrapped_stream()
         return response
     elapsed_ms = round((time.perf_counter() - start) * 1000.0, 2)
     record_request(method=method, path=path, status_code=response.status_code, duration_ms=elapsed_ms)
