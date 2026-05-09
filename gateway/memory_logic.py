@@ -4,6 +4,47 @@ import re
 from typing import Any
 
 MIN_MEMORY_FACT_CONFIDENCE = 0.75
+# Substrings for education/school-ish queries (include common typos so slots stay stable).
+_EDUCATION_HINT_TOKENS = (
+    "university",
+    "varsity",
+    "বিশ্ববিদ্যাল",
+    "univ",
+    "school",
+    "scholl",
+    "scool",
+    "skool",
+    "college",
+    "collge",
+    "institute",
+    "institution",
+    "education",
+    "alma mater",
+    "স্কুল",
+    "কলেজ",
+    "শিক্ষা",
+)
+_UNCERTAINTY_DONT_HAVE = "i don't have"
+_UNCERTAINTY_DONT_HAVE_FULL = "i do not have"
+_UNCERTAINTY_COULDNT_FIND = "couldn't find"
+ASSISTANT_UNCERTAINTY_MARKERS = (
+    "no marker set",
+    _UNCERTAINTY_DONT_HAVE,
+    _UNCERTAINTY_DONT_HAVE_FULL,
+    _UNCERTAINTY_COULDNT_FIND,
+    "not sure",
+    "not fully verified",
+    "possible memory",
+)
+_PERSONAL_REJECT_UNCERTAINTY_MARKERS = (
+    _UNCERTAINTY_DONT_HAVE,
+    _UNCERTAINTY_DONT_HAVE_FULL,
+    "i'm not sure",
+    "i am not sure",
+    "not enough information",
+    _UNCERTAINTY_COULDNT_FIND,
+)
+_CHAT_ASSISTANT_UNCERTAINTY_SNIPPETS = ("don't have", _UNCERTAINTY_COULDNT_FIND)
 
 
 def effective_memory_confidence(item: dict[str, Any]) -> float:
@@ -36,33 +77,83 @@ def select_context_memories(user_text: str, memories: list[dict[str, Any]]) -> l
         source = (item.get("source") or "").strip().lower()
         structured = item.get("structured_data") if isinstance(item.get("structured_data"), dict) else {}
         source_field = str(structured.get("source_field") or "").strip().lower()
-        if source == "chat_assistant":
-            if len(text) > 500:
-                continue
-            if text.startswith("I ") and ("don't have" in text.lower() or "couldn't find" in text.lower()):
-                continue
-            if float(item.get("importance") or 0.0) < 0.4:
-                continue
-        if source == "short_trace_context" and source_field == "assistant_response":
-            lowered = text.lower()
-            # Do not recycle assistant fallback/uncertainty text as factual memory evidence.
-            if any(
-                marker in lowered
-                for marker in (
-                    "no marker set",
-                    "i don't have",
-                    "i do not have",
-                    "couldn't find",
-                    "not sure",
-                    "not fully verified",
-                    "possible memory",
-                )
-            ):
-                continue
+        lowered = text.lower()
+        if _skip_chat_assistant_item(item=item, text=text, lower=lowered, relaxed=False):
+            continue
+        if _is_short_trace_assistant_uncertain(
+            source=source,
+            source_field=source_field,
+            lower=lowered,
+        ):
+            continue
         if has_question_like_shape(text):
             continue
         selected.append(item)
         if len(selected) >= 5:
+            break
+    return selected
+
+
+_BAD_MEMORY_TEXT_SIGNALS = (
+    "### task:",
+    "<chat_history>",
+    "json format:",
+    "follow_ups",
+    "guidelines:",
+    "output:",
+)
+
+
+def memory_text_has_noise_signals(text: str) -> bool:
+    lower = (text or "").strip().lower()
+    if not lower:
+        return True
+    return any(sig in lower for sig in _BAD_MEMORY_TEXT_SIGNALS)
+
+
+def looks_like_compact_structured_fact(text: str) -> bool:
+    """Slot-shaped memory lines slightly over the default length cap (used only after strict pool is empty)."""
+    t = (text or "").strip()
+    if not t or len(t) > 800:
+        return False
+    if ":" not in t:
+        return False
+    head, _, tail = t.partition(":")
+    head_s = head.strip()
+    if len(head_s) < 2 or len(head_s) > 64:
+        return False
+    return bool(tail.strip())
+
+
+def select_context_memories_relaxed_personal_fallback(user_text: str, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Second pass when strict select_context_memories returns nothing: keep noise gates and question-shape
+    filters, relax assistant importance/length slightly and allow compact structured facts up to 800 chars.
+    """
+    normalized_query = (user_text or "").strip().lower()
+    selected: list[dict[str, Any]] = []
+    for item in memories:
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        if memory_text_has_noise_signals(text):
+            continue
+        lower = text.lower()
+        if len(lower) > 500 and not looks_like_compact_structured_fact(text):
+            continue
+        if normalized_query and lower == normalized_query:
+            continue
+        source = (item.get("source") or "").strip().lower()
+        structured = item.get("structured_data") if isinstance(item.get("structured_data"), dict) else {}
+        source_field = str(structured.get("source_field") or "").strip().lower()
+        if _skip_chat_assistant_item(item=item, text=text, lower=lower, relaxed=True):
+            continue
+        if _is_short_trace_assistant_uncertain(source=source, source_field=source_field, lower=lower):
+            continue
+        if has_question_like_shape(text):
+            continue
+        selected.append(item)
+        if len(selected) >= 8:
             break
     return selected
 
@@ -77,23 +168,34 @@ def has_question_like_shape(text: str) -> bool:
     return lower.startswith(("what ", "who ", "where ", "when ", "why ", "how ", "can ", "should "))
 
 
+def _contains_assistant_uncertainty(lower: str) -> bool:
+    return any(marker in lower for marker in ASSISTANT_UNCERTAINTY_MARKERS)
+
+
+def _skip_chat_assistant_item(*, item: dict[str, Any], text: str, lower: str, relaxed: bool) -> bool:
+    source = (item.get("source") or "").strip().lower()
+    if source != "chat_assistant":
+        return False
+    if len(text) > (600 if relaxed else 500):
+        return True
+    if text.startswith("I ") and any(s in lower for s in _CHAT_ASSISTANT_UNCERTAINTY_SNIPPETS):
+        return True
+    threshold = 0.25 if relaxed else 0.4
+    return float(item.get("importance") or 0.0) < threshold
+
+
+def _is_short_trace_assistant_uncertain(*, source: str, source_field: str, lower: str) -> bool:
+    if source != "short_trace_context" or source_field != "assistant_response":
+        return False
+    # Do not recycle assistant fallback/uncertainty text as factual memory evidence.
+    return _contains_assistant_uncertainty(lower)
+
+
 def is_low_quality_memory_text(text: str) -> bool:
+    if memory_text_has_noise_signals(text):
+        return True
     lower = (text or "").strip().lower()
-    if not lower:
-        return True
-    bad_signals = (
-        "### task:",
-        "<chat_history>",
-        "json format:",
-        "follow_ups",
-        "guidelines:",
-        "output:",
-    )
-    if any(sig in lower for sig in bad_signals):
-        return True
-    if len(lower) > 500:
-        return True
-    return False
+    return len(lower) > 500
 
 
 def text_token_overlap(a: str, b: str) -> float:
@@ -108,11 +210,15 @@ def text_token_overlap(a: str, b: str) -> float:
 def detect_fact_slots(text: str) -> set[str]:
     t = (text or "").lower()
     slots: set[str] = set()
+    education_context = any(k in t for k in _EDUCATION_HINT_TOKENS)
     if any(k in t for k in ("information about", "info about", "tell me about", "who is ")):
         slots.add("name")
-    if any(k in t for k in ("university", "varsity", "বিশ্ববিদ্যাল", "univ")):
+    if education_context:
         slots.add("university")
-    if any(k in t for k in ("name", "nam", "নাম")):
+    wants_person_name = any(k in t for k in ("name", "nam", "নাম"))
+    # Avoid treating "... school/college/university ... name?" as a person-name question
+    # (also covers typos like "scholl" via `_EDUCATION_HINT_TOKENS`).
+    if wants_person_name and not (education_context and ("name" in t or "নাম" in t)):
         slots.add("name")
     if any(k in t for k in ("favorite", "favourite", "fav", "প্রিয়", "pochondo")):
         slots.add("favorite")
@@ -672,7 +778,7 @@ def extract_profile_full_slot_fact(query_text: str, profile_text: str) -> str | 
         normalized = normalized[:3000]
     slot_keywords: dict[str, tuple[str, ...]] = {
         "work": ("work", "worked", "office", "company", "employer", "role", "experience", "brotecs"),
-        "university": ("university", "education", "varsity", "campus"),
+        "university": ("university", "education", "varsity", "campus", "school", "college"),
         "email": ("email", "@"),
         "name": ("name", "full name"),
         "hobby": ("hobby", "interests"),
@@ -780,6 +886,11 @@ def is_personal_memory_query(text: str) -> bool:
         "designation",
         "পেশা",
     )
+    if re.search(
+        r"\b(where|what)\s+(city|town)\s+do\s+i\s+live\b|\bwhere\s+do\s+i\s+live\b",
+        t,
+    ):
+        return True
     return any(sig in t for sig in personal_signals)
 
 
@@ -836,15 +947,7 @@ def should_reject_personal_answer(
     if not is_personal_memory_query(query):
         return False
     # If the model is already uncertain, keep it (safe behavior).
-    uncertainty_markers = (
-        "i don't have",
-        "i do not have",
-        "i'm not sure",
-        "i am not sure",
-        "not enough information",
-        "couldn't find",
-    )
-    if any(marker in answer for marker in uncertainty_markers):
+    if any(marker in answer for marker in _PERSONAL_REJECT_UNCERTAINTY_MARKERS):
         return False
 
     query_slots = detect_fact_slots(query)
@@ -891,15 +994,7 @@ def clip_memory_text_for_context(text: str, max_chars: int) -> str:
     return (t[: max(1, max_chars - 3)].rstrip() + "...")
 
 
-_SEM_FALLBACK_UNCERTAINTY_MARKERS = (
-    "no marker set",
-    "i don't have",
-    "i do not have",
-    "couldn't find",
-    "not sure",
-    "not fully verified",
-    "possible memory",
-)
+_SEM_FALLBACK_UNCERTAINTY_MARKERS = ASSISTANT_UNCERTAINTY_MARKERS
 
 
 def _semantic_context_fallback_item_eligible(

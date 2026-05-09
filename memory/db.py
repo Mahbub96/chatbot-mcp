@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sqlite3
+from datetime import date, datetime
 
 from sqlalchemy import create_engine
 from sqlalchemy import text as sql_text
@@ -19,6 +21,12 @@ MEMORY_RECORDS_TABLE_INFO_SQL = "PRAGMA table_info(memory_records)"
 AUDIT_TABLE_PREFIXES = ("short_", "long_")
 AUDIT_TABLE_REGEX = re.compile(r"\b(?:FROM|JOIN|INTO|UPDATE)\s+([A-Za-z_]\w*)", re.IGNORECASE)
 audit_logger = logging.getLogger("memory.db.audit")
+
+
+# Python 3.12+ deprecates sqlite3 implicit adapters for date/datetime.
+# Register explicit adapters once so SQLAlchemy sqlite writes stay warning-free.
+sqlite3.register_adapter(datetime, lambda value: value.isoformat(sep=" "))
+sqlite3.register_adapter(date, lambda value: value.isoformat())
 
 
 def create_engine_and_session():

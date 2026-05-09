@@ -187,7 +187,7 @@ def inject_memory_context(
         "role": "system",
         "content": (
             "Relevant long-term memory for the same current user:\n"
-            "Treat these items as known user facts unless the user corrects them.\n"
+            "Treat these as candidate saved facts; prefer high-confidence matches and ask for clarification on conflicts.\n"
             + "\n".join(lines)
         ),
     }

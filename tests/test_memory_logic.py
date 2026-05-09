@@ -6,6 +6,8 @@ from gateway.memory_logic import blocks_semantic_memory_context_fallback
 from gateway.memory_logic import detect_fact_slots
 from gateway.memory_logic import is_personal_memory_query
 from gateway.memory_logic import memories_for_semantic_context_fallback
+from gateway.memory_logic import select_context_memories
+from gateway.memory_logic import select_context_memories_relaxed_personal_fallback
 
 
 class MemoryLogicTest(unittest.TestCase):
@@ -29,6 +31,37 @@ class MemoryLogicTest(unittest.TestCase):
             [{"text": "name: Md Mahbub Alam", "source": "profile_fact", "score": 0.9}],
         )
         self.assertIsNone(answer)
+
+    def test_school_name_query_does_not_match_person_name_fact(self):
+        answer = build_memory_first_answer(
+            "what is my school name",
+            [{"text": "name: Md Mahbub Alam", "source": "profile_fact", "score": 0.9}],
+        )
+        self.assertIsNone(answer)
+
+    def test_school_name_query_maps_to_university_slot(self):
+        slots = detect_fact_slots("school name ?")
+        self.assertIn("university", slots)
+        self.assertNotIn("name", slots)
+
+    def test_typo_school_spelling_maps_to_university_slot_not_name(self):
+        slots = detect_fact_slots("my scholl name ?")
+        self.assertIn("university", slots)
+        self.assertNotIn("name", slots)
+
+    def test_typo_school_name_query_does_not_match_person_name_fact(self):
+        answer = build_memory_first_answer(
+            "my scholl name ?",
+            [{"text": "name: Md Mahbub Alam", "source": "profile_fact", "score": 0.9}],
+        )
+        self.assertIsNone(answer)
+
+    def test_typo_school_name_query_matches_education_fact(self):
+        answer = build_memory_first_answer(
+            "my scholl name ?",
+            [{"text": "education: Stamford University Bangladesh", "source": "profile_fact", "score": 0.9}],
+        )
+        self.assertEqual(answer, "Saved fact: education: Stamford University Bangladesh")
 
     def test_university_fallback_skips_profile_full_blob(self):
         answer = build_memory_fallback_answer(
@@ -63,6 +96,31 @@ class MemoryLogicTest(unittest.TestCase):
     def test_work_query_is_personal_memory_query(self):
         self.assertTrue(is_personal_memory_query("where I work ?"))
 
+    def test_city_live_question_is_personal_memory_query(self):
+        self.assertTrue(is_personal_memory_query("what city do i live in"))
+        self.assertTrue(is_personal_memory_query("where do i live"))
+
+    def test_relaxed_personal_fallback_pool_keeps_low_importance_assistant_facts(self):
+        rows = [
+            {"text": "company: Brotecs", "source": "chat_assistant", "score": 0.82, "importance": 0.35},
+        ]
+        self.assertEqual(select_context_memories("what is my company", rows), [])
+        relaxed = select_context_memories_relaxed_personal_fallback("what is my company", rows)
+        self.assertEqual(len(relaxed), 1)
+
+    def test_relaxed_personal_fallback_drops_unstructured_long_chat_text(self):
+        long_blob = "word " * 120
+        rows = [{"text": long_blob, "source": "chat_user", "score": 0.9, "importance": 0.9}]
+        self.assertEqual(select_context_memories_relaxed_personal_fallback("what is my hobby", rows), [])
+
+    def test_relaxed_personal_fallback_keeps_compact_structured_line_over_500_chars(self):
+        text = "education: " + ("detail-" * 90)
+        self.assertGreater(len(text), 500)
+        rows = [{"text": text, "source": "profile_fact", "score": 0.9, "importance": 0.9}]
+        self.assertEqual(select_context_memories("what is my university name", rows), [])
+        relaxed = select_context_memories_relaxed_personal_fallback("what is my university name", rows)
+        self.assertEqual(len(relaxed), 1)
+
     def test_information_about_query_is_personal_memory_query(self):
         self.assertTrue(is_personal_memory_query("I need information about mahbub alam"))
 
@@ -76,6 +134,9 @@ class MemoryLogicTest(unittest.TestCase):
     def test_semantic_fallback_block_true_for_possessive_profile(self):
         self.assertTrue(blocks_semantic_memory_context_fallback("what is my university name"))
         self.assertTrue(blocks_semantic_memory_context_fallback("where do i work ?"))
+
+    def test_personal_about_me_query_is_treated_as_personal(self):
+        self.assertTrue(is_personal_memory_query("tell me about me"))
 
     def test_semantic_fallback_prefers_best_ranked_item(self):
         q = "notes on raft consensus"

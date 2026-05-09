@@ -179,6 +179,7 @@ def memory_stats(request: Request, memory_scope: str = "global"):
             "short_term_trace_total": int(short_total),
             "recent_short_traces": recent_short,
             "wrong_answer_guard_triggers": memory_metrics.get_wrong_answer_guard_triggers(memory_scope=scope),
+            "memory_filter": memory_metrics.get_memory_filter_snapshot(memory_scope=scope),
             "scope_resolution_trace": memory_metrics.get_scope_snapshot(memory_scope=scope),
             "retrieval_source_blend": memory_metrics.get_retrieval_source_blend_snapshot(memory_scope=scope),
             "shadow_monitor": memory_metrics.get_shadow_snapshot(memory_scope=scope),

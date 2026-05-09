@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any
 import logging
 
+from config import MEMORY_ANY_SCOPE_FALLBACK_ENABLED
+from gateway.memory_logic import is_personal_memory_query
 from gateway.memory_metrics import memory_metrics
 from memory.service import memory_service
 
@@ -167,7 +169,12 @@ class RetrievalService:
                     reverse=True,
                 )
                 _append_stage(lexical)
-            if len(out) < safe_limit:
+            if (
+                len(out) < safe_limit
+                and MEMORY_ANY_SCOPE_FALLBACK_ENABLED
+                and not out
+                and is_personal_memory_query(normalized_query)
+            ):
                 # Stage 5b: lexical fallback across all scopes (global DB access)
                 any_scope_pool = []
                 # Pull from full legacy record set across all scopes (includes manual/source records).

@@ -8,8 +8,12 @@ from gateway.main import app
 
 class GatewayMemoryFlowTest(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(app)
+        self._client_ctx = TestClient(app)
+        self.client = self._client_ctx.__enter__()
         self.scope = "test-gateway-memory-scope"
+
+    def tearDown(self):
+        self._client_ctx.__exit__(None, None, None)
 
     def test_memory_item_endpoints(self):
         add_res = self.client.post(
@@ -157,6 +161,96 @@ class GatewayMemoryFlowTest(unittest.TestCase):
         first_part = first_user["content"][0]
         self.assertEqual(first_part["type"], "text")
         self.assertIn("describe this visual content professionally", first_part["text"].lower())
+
+    def test_openwebui_followup_shortcut_not_triggered_on_partial_markers(self):
+        fake_complete = AsyncMock(return_value="Normal response path")
+
+        with patch("gateway.controllers.chat_controller.complete_llm", fake_complete):
+            res = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "stream": False,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "### task: summarize context\n"
+                                "<chat_history>\n"
+                                "Please provide concise bullets."
+                            ),
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(fake_complete.await_count, 1)
+        content = res.json()["choices"][0]["message"]["content"]
+        self.assertEqual(content, "Normal response path")
+        self.assertNotIn('"follow_ups"', content)
+
+    def test_structured_ingest_ack_not_true_when_store_fails_with_existing_profile_evidence(self):
+        structured_text = "\\documentclass{article}\n\\begin{document}\nEducation: Fixture University\n\\end{document}"
+        with (
+            patch("gateway.controllers.chat_controller.memory_service.maybe_store_from_user_turn", return_value=False),
+            patch(
+                "gateway.controllers.chat_controller.memory_service.latest_profile_full",
+                return_value={"text": "old saved profile"},
+            ),
+            patch(
+                "gateway.controllers.chat_controller.memory_service.list_profile_memories",
+                return_value=[{"text": "name: Existing User", "source": "profile_fact"}],
+            ),
+            patch(
+                "gateway.controllers.chat_controller.memory_service.list_profile_facts",
+                return_value=[{"text": "university: Existing U", "source": "profile_fact"}],
+            ),
+        ):
+            res = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "stream": False,
+                    "messages": [{"role": "user", "content": structured_text}],
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        content = res.json()["choices"][0]["message"]["content"]
+        self.assertIn("memory persistence failed", content.lower())
+        self.assertNotIn("saved it to memory", content.lower())
+
+    def test_tool_execution_is_rule_gated_even_if_intent_allows_tool(self):
+        fake_complete = AsyncMock(return_value="fallback text response")
+        with (
+            patch("gateway.controllers.chat_controller.complete_llm", fake_complete),
+            patch("gateway.controllers.chat_controller.route_intent") as mock_route,
+            patch("gateway.controllers.chat_controller.maybe_run_legacy_keyword_tool") as mock_tool,
+            patch("gateway.controllers.chat_controller.DEFAULT_REQUEST_CONTROL_POLICY") as mock_policy,
+        ):
+            mock_route.return_value.allow_tool = True
+            mock_route.return_value.route = "tool"
+            mock_policy.allows_tool_action.return_value = False
+            res = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "read file test.txt"}],
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(mock_tool.call_count, 0)
+        self.assertGreaterEqual(fake_complete.await_count, 1)
+
+    def test_low_confidence_validation_retries_only_once(self):
+        fake_complete = AsyncMock(side_effect=["I think it might be around there.", "final confident answer"])
+        with patch("gateway.controllers.chat_controller.complete_llm", fake_complete):
+            res = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "explain caching in one line"}],
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(fake_complete.await_count, 2)
 
 
 if __name__ == "__main__":

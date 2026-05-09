@@ -100,11 +100,14 @@ class FaissVectorStore:
     def _load_meta_from_sqlite(self) -> tuple[list[str], list[str]]:
         if not self._sqlite_db_path:
             return [], []
-        with sqlite3.connect(self._sqlite_db_path) as conn:
+        conn = sqlite3.connect(self._sqlite_db_path)
+        try:
             self._ensure_meta_table(conn)
             rows = conn.execute(
                 "SELECT memory_id, memory_scope FROM memory_vector_meta ORDER BY position ASC"
             ).fetchall()
+        finally:
+            conn.close()
         ids = [str(row[0]) for row in rows]
         scopes = [str(row[1]) for row in rows]
         return ids, scopes
@@ -112,7 +115,8 @@ class FaissVectorStore:
     def _persist_meta_to_sqlite(self) -> None:
         if not self._sqlite_db_path:
             return
-        with sqlite3.connect(self._sqlite_db_path) as conn:
+        conn = sqlite3.connect(self._sqlite_db_path)
+        try:
             self._ensure_meta_table(conn)
             conn.execute("DELETE FROM memory_vector_meta")
             payload = [(idx, memory_id, self.scopes[idx]) for idx, memory_id in enumerate(self.ids)]
@@ -121,6 +125,8 @@ class FaissVectorStore:
                 payload,
             )
             conn.commit()
+        finally:
+            conn.close()
 
     def add(self, *, memory_id: str, memory_scope: str, embedding: list[float]) -> None:
         vec = np.array([embedding], dtype="float32")

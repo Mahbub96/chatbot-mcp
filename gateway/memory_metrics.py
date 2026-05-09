@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 GUARD_WRONG_ANSWER_KEY = "guard.wrong_answer_triggered"
+MEMORY_FILTER_DECISION_PREFIX = "memory_filter."
 
 
 class MemoryMetrics:
@@ -159,6 +160,26 @@ class MemoryMetrics:
         return {
             "scope": scope,
             "counters": rows,
+        }
+
+    def record_memory_filter_decision(self, *, memory_scope: str, decision: str) -> None:
+        scope = (memory_scope or "global").strip() or "global"
+        normalized = (decision or "unknown").strip().lower().replace(" ", "_")
+        self._safe_increment(
+            scope=scope,
+            metric_key=f"{MEMORY_FILTER_DECISION_PREFIX}{normalized}",
+            delta=1,
+        )
+
+    def get_memory_filter_snapshot(self, *, memory_scope: str) -> dict:
+        scope = (memory_scope or "global").strip() or "global"
+        rows = self._repo().get_short_runtime_metric_counts(
+            memory_scope=scope,
+            prefix=MEMORY_FILTER_DECISION_PREFIX,
+        )
+        return {
+            "scope": scope,
+            "decisions": rows,
         }
 
 

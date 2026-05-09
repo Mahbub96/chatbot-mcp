@@ -98,6 +98,38 @@ class ShortTermRepositoryMixin:
             session.commit()
         return pruned
 
+    def enforce_short_term_ttl_across_scopes(self, *, retention_hours: int = 24) -> dict[str, int]:
+        """Delete short-* rows older than retention window for every memory_scope (boot hygiene)."""
+        safe_hours = max(1, int(retention_hours))
+        ttl_expr = f"datetime('now', '-{safe_hours} hours')"
+        pruned = {
+            "short_traces_ttl": 0,
+            "short_retrieval_logs_ttl": 0,
+            "short_memory_queue_ttl": 0,
+            "short_scope_resolution_events_ttl": 0,
+            "short_runtime_metrics_stale": 0,
+        }
+        ttl_specs = (
+            ("short_traces_ttl", "short_traces", "created_at"),
+            ("short_retrieval_logs_ttl", "short_retrieval_logs", "created_at"),
+            ("short_memory_queue_ttl", "short_memory_queue", "created_at"),
+            ("short_scope_resolution_events_ttl", "short_scope_resolution_events", "created_at"),
+            ("short_runtime_metrics_stale", "short_runtime_metrics", "updated_at"),
+        )
+        with self._session_factory() as session:
+            for metric_key, table, timestamp_col in ttl_specs:
+                result = session.execute(
+                    sql_text(
+                        f"""
+                        DELETE FROM {table}
+                        WHERE {timestamp_col} < {ttl_expr}
+                        """
+                    ),
+                )
+                pruned[metric_key] = int(result.rowcount or 0)
+            session.commit()
+        return pruned
+
     def create_short_scope_resolution_event(
         self,
         *,
@@ -281,6 +313,7 @@ class ShortTermRepositoryMixin:
             return bool(result.rowcount or 0)
 
     def list_recent_short_traces(self, *, memory_scope: str, limit: int = 60) -> list[dict]:
+        """Return recent traces without mutating rows (created_at drives TTL and ordering)."""
         normalized_scope = (memory_scope or "global").strip() or "global"
         safe_limit = max(1, min(50000, int(limit)))
         with self._session_factory() as session:
@@ -303,20 +336,6 @@ class ShortTermRepositoryMixin:
                 ),
                 {"scope": normalized_scope, "lim": safe_limit},
             ).mappings().all()
-            row_ids = [str(row.get("id") or "") for row in rows if str(row.get("id") or "").strip()]
-            if row_ids:
-                for row_id in row_ids:
-                    session.execute(
-                        sql_text(
-                            """
-                            UPDATE short_traces
-                            SET created_at = CURRENT_TIMESTAMP
-                            WHERE id = :id
-                            """
-                        ),
-                        {"id": row_id},
-                    )
-                session.commit()
         out: list[dict] = []
         for row in rows:
             out.append(

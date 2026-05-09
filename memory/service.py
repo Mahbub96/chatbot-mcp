@@ -14,8 +14,10 @@ from config import (
     LEGACY_READ_FALLBACK_ENABLED,
     LONG_TERM_PROMOTE_MIN_SCORE,
     MEMORY_AUTO_STORE,
+    MEMORY_FAILURE_STORE_MIN_CHARS,
     MEMORY_MAX_ITEMS,
     MEMORY_MIN_SCORE,
+    MEMORY_STORE_ASSISTANT_TURNS,
     MEMORY_TOP_K,
     MEMORY_VECTOR_BACKEND,
     SHORT_TERM_CLEAR_ON_RESTART,
@@ -32,6 +34,14 @@ from memory.vector_store import FaissVectorStore
 
 logger = logging.getLogger(__name__)
 LOW_QUALITY_QUEUE_SIGNALS = ("### task:", "<chat_history>", "json format:", "guidelines:", "follow_ups", "output:")
+# Key tail: letters/digits/underscore/slash/space or hyphen (alternation avoids brittle char-class ranges).
+_STRUCTURED_KV_KEY_TAIL = r"(?:[A-Za-z0-9_/ ]|-)"
+_STRUCTURED_KV_LINE_RE = re.compile(
+    rf"(?im)^\s*[A-Za-z](?:{_STRUCTURED_KV_KEY_TAIL}){{1,40}}\s*[:-]\s*[^\n]{{2,180}}\s*$"
+)
+_STRUCTURED_KV_CAPTURE_RE = re.compile(
+    rf"(?im)^\s*([A-Za-z](?:{_STRUCTURED_KV_KEY_TAIL}){{1,40}})\s*[:-]\s*([^\n]{{2,180}})\s*$"
+)
 
 try:
     from pydantic import BaseModel, Field
@@ -65,6 +75,7 @@ class MemoryService:
             if SHORT_TERM_CLEAR_ON_RESTART:
                 self.repo.clear_short_term_memory()
                 return
+            self.repo.enforce_short_term_ttl_across_scopes(retention_hours=SHORT_TERM_RETENTION_HOURS)
             self._enforce_short_term_retention("global")
         except Exception:
             # Startup hygiene must never break process boot.
@@ -163,14 +174,22 @@ class MemoryService:
 
         def _typed(payload: dict[str, Any]) -> dict[str, Any]:
             parsed = TypedClassificationResult(**(payload or {}))
-            result = parsed.model_dump()
-            result["importance_score"] = max(0.0, min(1.0, float(result.get("importance_score") or 0.0)))
-            result["category"] = str(result.get("category") or "general").strip().lower() or "general"
-            if not isinstance(result.get("structured_data"), dict):
-                result["structured_data"] = {}
-            return result
+            return self._normalize_classification_result(parsed.model_dump())
 
         return RunnableLambda(_normalize) | RunnableLambda(_heuristic) | RunnableLambda(_typed)
+
+    def _normalize_classification_result(self, result: dict[str, Any] | None) -> dict[str, Any]:
+        normalized = dict(result or {})
+        score = max(0.0, min(1.0, float(normalized.get("importance_score") or 0.0)))
+        normalized["importance_score"] = score
+        normalized["category"] = str(normalized.get("category") or "general").strip().lower() or "general"
+        if not isinstance(normalized.get("structured_data"), dict):
+            normalized["structured_data"] = {}
+        typed_should_store = bool(normalized.get("should_store", False))
+        # Align ingestion gate with long-term promotion threshold to avoid inconsistent behavior
+        # from external classifiers returning should_store=True with very low scores.
+        normalized["should_store"] = typed_should_store and score >= LONG_TERM_PROMOTE_MIN_SCORE
+        return normalized
 
     def close(self) -> None:
         try:
@@ -1222,12 +1241,38 @@ class MemoryService:
         self.vector.rebuild(rows=payload, embed_fn=self.embedder.embed)
         return {"success": True, "count": len(rows), "memory_scope": memory_scope}
 
+    @staticmethod
+    def _record_memory_filter_decision(*, memory_scope: str, decision: str) -> None:
+        try:
+            from gateway.memory_metrics import memory_metrics
+
+            memory_metrics.record_memory_filter_decision(memory_scope=memory_scope, decision=decision)
+        except Exception:
+            return
+
+    def should_store_memory_text(self, text: str, *, strict: bool = False) -> bool:
+        t = (text or "").strip()
+        if len(t) < (MEMORY_FAILURE_STORE_MIN_CHARS if strict else 8):
+            return False
+        if t.endswith("?") or t.endswith("؟"):
+            return False
+        lowered = t.lower()
+        if re.match(r"^\s*(what|who|where|when|why|how|can|should|do|does|did|is|are|am|tell me)\b", lowered):
+            return False
+        if any(sig in lowered for sig in LOW_QUALITY_QUEUE_SIGNALS):
+            return False
+        if len(t) > 800 and not self._looks_like_structured_text(t):
+            return False
+        return True
+
     def maybe_store_from_user_turn(self, *, text: str, memory_scope: str = "global") -> bool:
         if not MEMORY_AUTO_STORE:
+            self._record_memory_filter_decision(memory_scope=memory_scope, decision="user_auto_store_disabled")
             logger.debug("structured_store_decision scope=%s reason=auto_store_disabled", memory_scope)
             return False
         t = (text or "").strip()
-        if len(t) < 8:
+        if not self.should_store_memory_text(t):
+            self._record_memory_filter_decision(memory_scope=memory_scope, decision="user_text_filter_reject")
             logger.debug("structured_store_decision scope=%s reason=text_too_short text_len=%s", memory_scope, len(t))
             return False
         queue_id, classification = self._enqueue_short_memory_candidate(text=t, memory_scope=memory_scope)
@@ -1238,6 +1283,7 @@ class MemoryService:
             try:
                 self._store_structured_facts(t, memory_scope=memory_scope)
                 self._finalize_short_memory_queue_item(queue_id=queue_id, extraction_status="processed")
+                self._record_memory_filter_decision(memory_scope=memory_scope, decision="user_store_structured")
                 logger.debug(
                     "structured_store_success scope=%s text_len=%s mode=full_and_facts",
                     memory_scope,
@@ -1256,6 +1302,7 @@ class MemoryService:
                 try:
                     self._store_full_profile_text(t, memory_scope=memory_scope)
                     self._finalize_short_memory_queue_item(queue_id=queue_id, extraction_status="processed")
+                    self._record_memory_filter_decision(memory_scope=memory_scope, decision="user_store_structured_fallback")
                     logger.info(
                         "structured_store_fallback_success scope=%s text_len=%s mode=profile_full_only",
                         memory_scope,
@@ -1270,26 +1317,16 @@ class MemoryService:
                         fallback_exc,
                     )
                     self._finalize_short_memory_queue_item(queue_id=queue_id, extraction_status="rejected")
+                    self._record_memory_filter_decision(memory_scope=memory_scope, decision="user_store_structured_failed")
                     return False
-        if t.endswith("?") or t.endswith("؟"):
+        if not self.should_store_memory_text(t):
             self._finalize_short_memory_queue_item(queue_id=queue_id, extraction_status="rejected")
-            logger.debug("structured_store_decision scope=%s reason=question_text text_len=%s", memory_scope, len(t))
-            return False
-        lowered = t.lower()
-        if re.match(r"^\s*(what|who|where|when|why|how|can|should|do|does|did|is|are|am|tell me)\b", lowered):
-            self._finalize_short_memory_queue_item(queue_id=queue_id, extraction_status="rejected")
-            logger.debug("structured_store_decision scope=%s reason=question_like_prefix text_len=%s", memory_scope, len(t))
-            return False
-        if any(sig in lowered for sig in LOW_QUALITY_QUEUE_SIGNALS):
-            self._finalize_short_memory_queue_item(queue_id=queue_id, extraction_status="rejected")
-            logger.debug("structured_store_decision scope=%s reason=low_quality_signal text_len=%s", memory_scope, len(t))
-            return False
-        if len(t) > 800:
-            self._finalize_short_memory_queue_item(queue_id=queue_id, extraction_status="rejected")
-            logger.debug("structured_store_decision scope=%s reason=text_too_long_not_structured text_len=%s", memory_scope, len(t))
+            self._record_memory_filter_decision(memory_scope=memory_scope, decision="user_text_filter_reject")
+            logger.debug("structured_store_decision scope=%s reason=memory_text_filter text_len=%s", memory_scope, len(t))
             return False
         if not classification["should_store"]:
             self._finalize_short_memory_queue_item(queue_id=queue_id, extraction_status="rejected")
+            self._record_memory_filter_decision(memory_scope=memory_scope, decision="user_classifier_reject")
             logger.debug(
                 "structured_store_decision scope=%s reason=classifier_reject text_len=%s importance=%s category=%s",
                 memory_scope,
@@ -1305,9 +1342,11 @@ class MemoryService:
         )
         if promoted:
             self._finalize_short_memory_queue_item(queue_id=queue_id, extraction_status="processed")
+            self._record_memory_filter_decision(memory_scope=memory_scope, decision="user_store_promoted")
             logger.debug("structured_store_decision scope=%s reason=promoted_non_structured text_len=%s", memory_scope, len(t))
             return True
         self._finalize_short_memory_queue_item(queue_id=queue_id, extraction_status="rejected")
+        self._record_memory_filter_decision(memory_scope=memory_scope, decision="user_promote_failed")
         logger.debug("structured_store_decision scope=%s reason=promote_failed_non_structured text_len=%s", memory_scope, len(t))
         return False
 
@@ -2064,8 +2103,12 @@ class MemoryService:
         }
 
     def maybe_store_from_assistant_turn(self, *, text: str, memory_scope: str = "global") -> None:
+        if not MEMORY_AUTO_STORE or not MEMORY_STORE_ASSISTANT_TURNS:
+            self._record_memory_filter_decision(memory_scope=memory_scope, decision="assistant_store_disabled")
+            return
         t = (text or "").strip()
-        if len(t) < 8:
+        if not self.should_store_memory_text(t):
+            self._record_memory_filter_decision(memory_scope=memory_scope, decision="assistant_text_filter_reject")
             return
         lower = t.lower()
         # Avoid storing uncertainty/meta chatter as durable memory.
@@ -2081,10 +2124,9 @@ class MemoryService:
             )
         ):
             return
-        if len(t) > 1200:
-            return
         classification = self.classify_memory_candidate(t)
         if not classification["should_store"]:
+            self._record_memory_filter_decision(memory_scope=memory_scope, decision="assistant_classifier_reject")
             return
         self.add_memory(
             text=t,
@@ -2095,6 +2137,7 @@ class MemoryService:
             category=classification["category"],
             structured_data=classification["structured_data"],
         )
+        self._record_memory_filter_decision(memory_scope=memory_scope, decision="assistant_store")
         prom_score = max(0.0, min(1.0, float(classification.get("importance_score") or 0.0)))
         if prom_score >= LONG_TERM_PROMOTE_MIN_SCORE:
             self._promote_user_fact_to_long_term(
@@ -2162,14 +2205,14 @@ class MemoryService:
             result = self._typed_classification_chain.invoke(text)
             if isinstance(result, dict):
                 logger.debug("typed_classification_success")
-                return result
+                return self._normalize_classification_result(result)
         except Exception:
             logger.debug("typed_classification_fallback", exc_info=True)
         return self._heuristic_classify_memory_candidate(text)
 
     def _looks_like_structured_text(self, text: str) -> bool:
         lower = (text or "").lower()
-        # Keep this in sync with gateway.helpers.memory_logic.looks_like_structured_document_text
+        # Keep dense structured detection aligned with gateway.memory_logic.looks_like_structured_document_text
         # to avoid false "persistence failed" acknowledgements.
         if len(lower) > 700:
             return True
@@ -2177,10 +2220,7 @@ class MemoryService:
         if sum(1 for s in signals if s in lower) >= 2:
             return True
         # Also treat dense profile-style key:value text as structured.
-        key_value_lines = re.findall(
-            r"(?im)^\s*[A-Za-z][A-Za-z0-9 _/\-]{1,40}\s*[:\-]\s*[^\n]{2,180}\s*$",
-            text or "",
-        )
+        key_value_lines = _STRUCTURED_KV_LINE_RE.findall(text or "")
         return len(key_value_lines) >= 4
 
     def _store_structured_facts(self, text: str, *, memory_scope: str) -> None:
@@ -2252,7 +2292,7 @@ class MemoryService:
                 break
 
         # Generic "key: value" facts (works for profile, project specs, metadata etc.)
-        for m in re.finditer(r"(?im)^\s*([A-Za-z][A-Za-z0-9 _/\-]{1,40})\s*[:\-]\s*([^\n]{2,180})\s*$", normalized):
+        for m in _STRUCTURED_KV_CAPTURE_RE.finditer(normalized):
             key = m.group(1).strip().lower().replace("  ", " ")
             key = key_aliases.get(key, key)
             value = re.sub(r"^[*\-\s]+", "", m.group(2).strip())
@@ -2282,7 +2322,7 @@ class MemoryService:
                 continue
             if not current_section_key:
                 continue
-            cleaned = re.sub(r"^[*\\-\\d.\\s]+", "", line).strip()
+            cleaned = re.sub(r"^[*\d.\s-]+", "", line).strip()
             if len(cleaned) < 3:
                 continue
             if cleaned.lower().startswith(("input:", "processing:", "output:", "deployment:", "focus:")):
@@ -2292,14 +2332,14 @@ class MemoryService:
         for key, values in bucket.items():
             if not values:
                 continue
-            merged = "; ".join(v for v in values[:8])
+            merged = "; ".join(values[:8])
             if len(merged) > 240:
                 merged = merged[:240].rstrip(" ,;") + "..."
             if self._is_valid_fact_pair(key, merged):
                 out.append(f"{key}: {merged}")
 
         # Generic first-person statements: "my X is Y"
-        for m in re.finditer(r"(?im)\bmy\s+([a-z][a-z0-9 _/\-]{1,40})\s+is\s+([^.\n]{2,160})", normalized):
+        for m in re.finditer(r"(?im)\bmy\s+([a-z][a-z0-9 _/-]{1,40})\s+is\s+([^.\n]{2,160})", normalized):
             key = m.group(1).strip().lower()
             value = m.group(2).strip()
             if self._is_valid_fact_pair(key, value):

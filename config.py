@@ -82,6 +82,37 @@ VISION_PER_MODEL_TIMEOUT_SECONDS = max(5, int(os.getenv("VISION_PER_MODEL_TIMEOU
 TEXT_STREAM_STATUS_INTERVAL_SECONDS = max(1.0, float(os.getenv("TEXT_STREAM_STATUS_INTERVAL_SECONDS") or "3"))
 TEXT_STREAM_FIRST_TOKEN_TIMEOUT_SECONDS = max(5.0, float(os.getenv("TEXT_STREAM_FIRST_TOKEN_TIMEOUT_SECONDS") or "25"))
 TEXT_STREAM_TIMEOUT_FALLBACK_MODEL = (os.getenv("TEXT_STREAM_TIMEOUT_FALLBACK_MODEL") or "").strip()
+MAX_RETRIES = max(1, int(os.getenv("MAX_RETRIES") or "2"))
+MAX_STREAM_IDLE_TIMEOUTS = max(1, int(os.getenv("MAX_STREAM_IDLE_TIMEOUTS") or "3"))
+MAX_STREAM_POST_FIRST_TOKEN_SECONDS = max(5.0, float(os.getenv("MAX_STREAM_POST_FIRST_TOKEN_SECONDS") or "25"))
+MAX_TOOL_ACTIONS_PER_REQUEST = max(1, int(os.getenv("MAX_TOOL_ACTIONS_PER_REQUEST") or "1"))
+MAX_VISION_MODEL_ATTEMPTS = max(1, int(os.getenv("MAX_VISION_MODEL_ATTEMPTS") or "2"))
+RESPONSE_VALIDATION_RETRY_ENABLED = (os.getenv("RESPONSE_VALIDATION_RETRY_ENABLED") or "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+INTENT_LLM_SUGGESTION_ENABLED = (os.getenv("INTENT_LLM_SUGGESTION_ENABLED") or "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+INTENT_LLM_SUGGESTION_TIMEOUT_SECONDS = max(1.0, float(os.getenv("INTENT_LLM_SUGGESTION_TIMEOUT_SECONDS") or "2.0"))
+MEMORY_STORE_ASSISTANT_TURNS = (os.getenv("MEMORY_STORE_ASSISTANT_TURNS") or "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+MEMORY_ANY_SCOPE_FALLBACK_ENABLED = (os.getenv("MEMORY_ANY_SCOPE_FALLBACK_ENABLED") or "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+MEMORY_FAILURE_STORE_MIN_CHARS = max(8, int(os.getenv("MEMORY_FAILURE_STORE_MIN_CHARS") or "20"))
 MAX_VISION_IMAGE_BYTES = max(256 * 1024, int(os.getenv("MAX_VISION_IMAGE_BYTES") or str(5 * 1024 * 1024)))
 MAX_VISION_VIDEO_BYTES = max(1024 * 1024, int(os.getenv("MAX_VISION_VIDEO_BYTES") or str(30 * 1024 * 1024)))
 VISION_VIDEO_MAX_FRAMES = max(1, int(os.getenv("VISION_VIDEO_MAX_FRAMES") or "4"))

@@ -6,7 +6,11 @@ from memory.service import memory_service
 
 
 class ShortTermMemoryService:
-    """Handles temporary memory/trace writes."""
+    """Ephemeral layer: `short_traces`, retrieval logs, and `short_memory_queue` staging.
+
+    Promotion to durable memory (`memory_records`, embeddings, long_term entities) goes through
+    `MemoryService.maybe_store_from_*` / `log_chat_trace`, not through this facade alone.
+    """
 
     def store_trace(
         self,
