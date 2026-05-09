@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -10,10 +11,12 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from config import (
+    BASE_DIR,
     DEBUG_LOG_FILE,
     DEBUG_LOG_TO_FILE,
     DEBUG_MODE,
     LOG_JSON,
+    MEMORY_SEMANTIC_CONTEXT_FALLBACK_ENABLED,
     STEP_LOG_ENABLED,
     STEP_LOG_FILE,
 )
@@ -44,6 +47,23 @@ def _has_file_handler(logger_obj: logging.Logger, file_path: str) -> bool:
                 return True
     return False
 
+
+def _configure_step_logging() -> None:
+    """Step traces go to STEP_LOG_FILE whenever STEP_LOG_ENABLED (not gated on DEBUG_MODE)."""
+    if not STEP_LOG_ENABLED:
+        return
+    step_path = Path(STEP_LOG_FILE).expanduser()
+    step_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_step = str(step_path.resolve())
+    if not _has_file_handler(step_logger, resolved_step):
+        step_handler = logging.FileHandler(resolved_step, encoding="utf-8")
+        step_handler.setLevel(logging.INFO)
+        step_handler.setFormatter(logging.Formatter("%(message)s"))
+        step_logger.addHandler(step_handler)
+    step_logger.setLevel(logging.INFO)
+    step_logger.propagate = False
+
+
 def _configure_debug_logging() -> None:
     if not DEBUG_MODE:
         return
@@ -58,17 +78,6 @@ def _configure_debug_logging() -> None:
             file_handler.setLevel(logging.DEBUG)
             file_handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
             root.addHandler(file_handler)
-    if STEP_LOG_ENABLED:
-        step_path = Path(STEP_LOG_FILE).expanduser()
-        step_path.parent.mkdir(parents=True, exist_ok=True)
-        resolved_step = str(step_path.resolve())
-        if not _has_file_handler(step_logger, resolved_step):
-            step_handler = logging.FileHandler(resolved_step, encoding="utf-8")
-            step_handler.setLevel(logging.INFO)
-            step_handler.setFormatter(logging.Formatter("%(message)s"))
-            step_logger.addHandler(step_handler)
-        step_logger.setLevel(logging.INFO)
-        step_logger.propagate = False
     for handler in root.handlers:
         handler.setLevel(logging.DEBUG)
     logging.getLogger("uvicorn").setLevel(logging.DEBUG)
@@ -78,14 +87,46 @@ def _configure_debug_logging() -> None:
     logger.debug("debug_mode_enabled")
 
 
+_configure_step_logging()
 _configure_debug_logging()
+
+
+def _read_git_short_sha() -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        out = (proc.stdout or "").strip()
+        return out if out else "unknown"
+    except Exception:
+        return "unknown"
 
 
 @app.on_event("startup")
 async def startup_init():
+    _configure_step_logging()
     if DEBUG_MODE:
         logger.debug("gateway_startup_init_begin")
     await memory_pipeline.start()
+    if STEP_LOG_ENABLED:
+        import gateway.controllers.chat_controller as chat_controller_module
+
+        boot_msg = (
+            "gateway.step_log_boot "
+            f"revision={_read_git_short_sha()} "
+            f"step_log_file={Path(STEP_LOG_FILE).expanduser().resolve()} "
+            f"semantic_fallback_enabled={MEMORY_SEMANTIC_CONTEXT_FALLBACK_ENABLED} "
+            f"chat_controller_file={Path(chat_controller_module.__file__).resolve()}"
+        )
+        if step_logger.handlers:
+            step_logger.info(boot_msg)
+        else:
+            logger.info(boot_msg)
     if DEBUG_MODE:
         logger.debug("gateway_startup_init_done")
 

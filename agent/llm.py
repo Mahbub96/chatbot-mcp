@@ -8,6 +8,7 @@ from config import (
     IMAGE_EDIT_MODEL,
     IMAGE_GEN_MODEL,
     MODEL,
+    STREAM_CHAT_READ_TIMEOUT_SECONDS,
     get_nvidia_api_key,
 )
 
@@ -73,7 +74,13 @@ class LLMClient:
             "stream": not is_image_request,
             "temperature": 0.7,
         }
-        read_timeout = VISION_READ_TIMEOUT if is_image_request else TEXT_READ_TIMEOUT
+        # Streaming: read timeout is time between chunks; slow first-token needs a large value.
+        if is_image_request:
+            read_timeout = VISION_READ_TIMEOUT
+        elif payload.get("stream"):
+            read_timeout = float(STREAM_CHAT_READ_TIMEOUT_SECONDS)
+        else:
+            read_timeout = TEXT_READ_TIMEOUT
 
         try:
             timeout = httpx.Timeout(
@@ -164,7 +171,13 @@ class LLMClient:
                         continue
 
         except httpx.RequestError as e:
-            error_msg = f"[NETWORK_ERROR] {str(e) or repr(e)}"
+            detail = (str(e) or "").strip() or e.__class__.__name__
+            if isinstance(e, httpx.ReadTimeout):
+                detail = (
+                    f"ReadTimeout: no data from upstream within {read_timeout}s "
+                    "(between chunks). Increase STREAM_CHAT_READ_TIMEOUT_SECONDS if needed."
+                )
+            error_msg = f"[NETWORK_ERROR] {detail}"
             logger.error(error_msg)
             yield error_msg
 

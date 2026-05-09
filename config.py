@@ -35,6 +35,8 @@ EMBEDDING_DIM = max(128, int(os.getenv("EMBEDDING_DIM") or "1024"))
 EMBEDDING_TIMEOUT_SECONDS = max(5, int(os.getenv("EMBEDDING_TIMEOUT_SECONDS") or "20"))
 IMAGE_BASE_URL = os.getenv("IMAGE_BASE_URL") or "https://integrate.api.nvidia.com/v1/images/generations"
 IMAGE_EDIT_BASE_URL = os.getenv("IMAGE_EDIT_BASE_URL") or "https://integrate.api.nvidia.com/v1/images/edits"
+# Max seconds between SSE chunks when streaming chat (covers slow TTFT / stalled upstream).
+STREAM_CHAT_READ_TIMEOUT_SECONDS = max(60, int(os.getenv("STREAM_CHAT_READ_TIMEOUT_SECONDS") or "300"))
 MEMORY_ENABLED = (os.getenv("MEMORY_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
 MEMORY_SQLITE_URL = os.getenv("MEMORY_SQLITE_URL") or f"sqlite:///{(BASE_DIR / 'files' / 'memory.db').as_posix()}"
 MEMORY_VECTOR_PATH = os.getenv("MEMORY_VECTOR_PATH") or str(BASE_DIR / "files" / "faiss_store")
@@ -47,7 +49,20 @@ PGVECTOR_HNSW_M = max(8, int(os.getenv("PGVECTOR_HNSW_M") or "16"))
 PGVECTOR_HNSW_EF_CONSTRUCTION = max(16, int(os.getenv("PGVECTOR_HNSW_EF_CONSTRUCTION") or "64"))
 MEMORY_TOP_K = int(os.getenv("MEMORY_TOP_K") or "5")
 MEMORY_MIN_SCORE = float(os.getenv("MEMORY_MIN_SCORE") or "0.20")
+MEMORY_SEMANTIC_CONTEXT_FALLBACK_ENABLED = (os.getenv("MEMORY_SEMANTIC_CONTEXT_FALLBACK_ENABLED") or "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+MEMORY_SEMANTIC_CONTEXT_FALLBACK_MIN_SCORE = float(
+    os.getenv("MEMORY_SEMANTIC_CONTEXT_FALLBACK_MIN_SCORE") or os.getenv("MEMORY_MIN_SCORE") or "0.20"
+)
+MEMORY_SEMANTIC_CONTEXT_FALLBACK_MIN_TOKEN_OVERLAP = float(os.getenv("MEMORY_SEMANTIC_CONTEXT_FALLBACK_MIN_TOKEN_OVERLAP") or "0.12")
+MEMORY_SEMANTIC_CONTEXT_FALLBACK_MAX_CHARS = max(200, int(os.getenv("MEMORY_SEMANTIC_CONTEXT_FALLBACK_MAX_CHARS") or "520"))
 MEMORY_AUTO_STORE = (os.getenv("MEMORY_AUTO_STORE") or "true").strip().lower() in {"1", "true", "yes", "on"}
+# Minimum classifier importance for upserting normalized long_term entities (attributes / embeddings).
+LONG_TERM_PROMOTE_MIN_SCORE = max(0.0, min(1.0, float(os.getenv("LONG_TERM_PROMOTE_MIN_SCORE") or "0.6")))
 MEMORY_MAX_ITEMS = int(os.getenv("MEMORY_MAX_ITEMS") or "5000")
 SHORT_TERM_TRACE_MAX_ITEMS = int(os.getenv("SHORT_TERM_TRACE_MAX_ITEMS") or "20000")
 SHORT_TERM_RETENTION_HOURS = max(1, int(os.getenv("SHORT_TERM_RETENTION_HOURS") or "24"))
@@ -64,6 +79,9 @@ STEP_LOG_ENABLED = (os.getenv("STEP_LOG_ENABLED") or "false").strip().lower() in
 STEP_LOG_FILE = os.getenv("STEP_LOG_FILE") or str(BASE_DIR / "step.log")
 VISION_STREAM_TIMEOUT_SECONDS = int(os.getenv("VISION_STREAM_TIMEOUT_SECONDS") or "90")
 VISION_PER_MODEL_TIMEOUT_SECONDS = max(5, int(os.getenv("VISION_PER_MODEL_TIMEOUT_SECONDS") or "30"))
+TEXT_STREAM_STATUS_INTERVAL_SECONDS = max(1.0, float(os.getenv("TEXT_STREAM_STATUS_INTERVAL_SECONDS") or "3"))
+TEXT_STREAM_FIRST_TOKEN_TIMEOUT_SECONDS = max(5.0, float(os.getenv("TEXT_STREAM_FIRST_TOKEN_TIMEOUT_SECONDS") or "25"))
+TEXT_STREAM_TIMEOUT_FALLBACK_MODEL = (os.getenv("TEXT_STREAM_TIMEOUT_FALLBACK_MODEL") or "").strip()
 MAX_VISION_IMAGE_BYTES = max(256 * 1024, int(os.getenv("MAX_VISION_IMAGE_BYTES") or str(5 * 1024 * 1024)))
 MAX_VISION_VIDEO_BYTES = max(1024 * 1024, int(os.getenv("MAX_VISION_VIDEO_BYTES") or str(30 * 1024 * 1024)))
 VISION_VIDEO_MAX_FRAMES = max(1, int(os.getenv("VISION_VIDEO_MAX_FRAMES") or "4"))
@@ -75,6 +93,7 @@ HUMAN_TONE_INSTRUCTION = (
     or "Respond in a natural, warm, and human tone. Be clear, concise, and conversational."
 )
 SHADOW_MONITOR_ENABLED = (os.getenv("SHADOW_MONITOR_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
+SHADOW_MONITOR_SAMPLE_RATE = min(1.0, max(0.0, float(os.getenv("SHADOW_MONITOR_SAMPLE_RATE") or "0.25")))
 LEGACY_READ_FALLBACK_ENABLED = (os.getenv("LEGACY_READ_FALLBACK_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
 LEGACY_WRITE_ENABLED = (os.getenv("LEGACY_WRITE_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
 PROFILE_ANY_SCOPE_FALLBACK_ENABLED = (os.getenv("PROFILE_ANY_SCOPE_FALLBACK_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}

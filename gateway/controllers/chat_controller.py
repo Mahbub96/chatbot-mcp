@@ -4,8 +4,10 @@ import asyncio
 import contextlib
 import json
 import logging
+import subprocess
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from fastapi import Request
@@ -16,12 +18,20 @@ from config import (
     BANGLA_MODEL,
     CODE_MODEL,
     MEMORY_ENABLED,
+    MEMORY_SEMANTIC_CONTEXT_FALLBACK_ENABLED,
+    MEMORY_SEMANTIC_CONTEXT_FALLBACK_MAX_CHARS,
+    MEMORY_SEMANTIC_CONTEXT_FALLBACK_MIN_SCORE,
+    MEMORY_SEMANTIC_CONTEXT_FALLBACK_MIN_TOKEN_OVERLAP,
     MAX_VISION_IMAGE_BYTES,
     MAX_VISION_VIDEO_BYTES,
     MODEL as DEFAULT_UPSTREAM_MODEL,
     RATE_LIMIT_MAX_REQUESTS,
     RATE_LIMIT_WINDOW_SECONDS,
     SHADOW_MONITOR_ENABLED,
+    SHADOW_MONITOR_SAMPLE_RATE,
+    TEXT_STREAM_FIRST_TOKEN_TIMEOUT_SECONDS,
+    TEXT_STREAM_STATUS_INTERVAL_SECONDS,
+    TEXT_STREAM_TIMEOUT_FALLBACK_MODEL,
     VISION_PER_MODEL_TIMEOUT_SECONDS,
     VISION_STREAM_TIMEOUT_SECONDS,
     VISION_FALLBACK_MODELS,
@@ -57,12 +67,14 @@ from gateway.helpers.memory_logic import (
     is_cv_query,
     is_exact_cv_request,
     is_exact_shared_request,
+    blocks_semantic_memory_context_fallback,
     is_offer_intent_query,
     is_personal_memory_query,
     is_shared_summary_request,
     is_user_profile_summary_query,
     looks_like_structured_document_text,
     matched_memories_for_query,
+    memories_for_semantic_context_fallback,
     pick_best_shared_memory,
     select_context_memories,
     should_reject_personal_answer,
@@ -83,6 +95,21 @@ from router.tool_router import maybe_run_legacy_keyword_tool
 
 logger = logging.getLogger(__name__)
 step_logger = logging.getLogger("gateway.steps")
+
+
+def _runtime_revision() -> str:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True, timeout=2)
+        return (out or "").strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+RUNTIME_SIGNATURE = (
+    f"revision={_runtime_revision()}|semantic_fallback={MEMORY_SEMANTIC_CONTEXT_FALLBACK_ENABLED}|"
+    f"controller={Path(__file__).resolve()}"
+)
+
 
 ERR_TOO_MANY_REQUESTS = "Too many requests"
 ERR_INVALID_JSON_BODY = "Invalid JSON body"
@@ -288,6 +315,20 @@ def infer_retrieval_method(retrieved_items: list[dict[str, Any]]) -> str:
     return "fts"
 
 
+def should_run_shadow_compare(request_id: str) -> bool:
+    if not SHADOW_MONITOR_ENABLED:
+        return False
+    if SHADOW_MONITOR_SAMPLE_RATE >= 1.0:
+        return True
+    if SHADOW_MONITOR_SAMPLE_RATE <= 0.0:
+        return False
+    try:
+        bucket = uuid.UUID(str(request_id)).int % 10000
+    except Exception:
+        bucket = int(time.time() * 1000) % 10000
+    return bucket < int(SHADOW_MONITOR_SAMPLE_RATE * 10000)
+
+
 def resolve_local_personal_fallback(
     *,
     user_text: str,
@@ -319,6 +360,28 @@ def resolve_local_personal_fallback(
     return None
 
 
+def fallback_context_memories_when_unmatched(
+    *,
+    user_text: str,
+    retrieved_items: list[dict[str, Any]],
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    if not user_text or not retrieved_items:
+        return []
+    if not is_personal_memory_query(user_text):
+        return []
+    prioritized: list[dict[str, Any]] = []
+    for item in retrieved_items:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source") or "").strip().lower()
+        if source in {"short_trace", "short_trace_context", "long_term_attribute", "profile_fact", "profile_full"}:
+            prioritized.append(item)
+    if not prioritized:
+        prioritized = [item for item in retrieved_items if isinstance(item, dict)]
+    return prioritized[: max(1, limit)]
+
+
 def persist_user_memory_on_failure(*, user_text: str, memory_scope: str) -> None:
     if not MEMORY_ENABLED:
         return
@@ -337,31 +400,44 @@ async def persist_turn_memory(
     user_text: str,
     assistant_text: str,
     memory_scope: str,
+    on_step: Any | None = None,
 ) -> None:
+    def _emit(step_name: str) -> None:
+        if callable(on_step):
+            try:
+                on_step(step_name)
+            except Exception:
+                return
+
     if not MEMORY_ENABLED:
         return
     normalized_user = (user_text or "").strip()
     normalized_assistant = (assistant_text or "").strip()
     if not normalized_user and not normalized_assistant:
         return
+    _emit("short_memory.persist_turn.start")
     # Read-your-write consistency: for personal-memory turns, persist inline
     # so immediate cross-thread requests can retrieve the latest facts.
     if normalized_user and is_personal_memory_query(normalized_user):
         try:
+            _emit("short_memory.persist_turn.inline.user")
             await asyncio.to_thread(
                 memory_service.maybe_store_from_user_turn,
                 text=normalized_user,
                 memory_scope=memory_scope,
             )
+            _emit("short_memory.persist_turn.inline.assistant")
             await asyncio.to_thread(
                 memory_service.maybe_store_from_assistant_turn,
                 text=normalized_assistant,
                 memory_scope=memory_scope,
             )
+            _emit("short_memory.persist_turn.inline.done")
             return
         except Exception:
             # Fallback to queue path without breaking response.
-            pass
+            _emit("short_memory.persist_turn.inline.failed_queue_fallback")
+    _emit("short_memory.persist_turn.queue_enqueue")
     memory_pipeline.enqueue(
         memory_scope=memory_scope,
         user_text=normalized_user,
@@ -516,6 +592,7 @@ async def handle_chat_completions(request: Request) -> Any:
             step_logger.info(message)
 
     log_step("handle_chat_completions.start")
+    log_step(f"runtime.signature[{RUNTIME_SIGNATURE}]")
     client_ip = request.client.host if request.client else "unknown"
     log_step("rate_limiter.is_limited")
     if rate_limiter.is_limited(client_ip):
@@ -597,9 +674,11 @@ async def handle_chat_completions(request: Request) -> Any:
                 memory_scope=memory_scope,
                 limit=10,
             )
+            log_step(f"short_memory.retrieve.done[{len(memories)}]")
             retrieval_trace_items = memories[:]
-            if SHADOW_MONITOR_ENABLED:
+            if should_run_shadow_compare(request_id):
                 try:
+                    log_step("short_memory.retrieve.shadow_compare.start")
                     legacy_shadow = await asyncio.to_thread(
                         memory_service.search_legacy_only,
                         query=user_text,
@@ -611,9 +690,11 @@ async def handle_chat_completions(request: Request) -> Any:
                         prod_items=memories,
                         shadow_items=legacy_shadow,
                     )
+                    log_step("short_memory.retrieve.shadow_compare.done")
                 except Exception:
                     logger.debug("shadow_monitor_compare_failed", exc_info=True)
             retrieval_method = infer_retrieval_method(retrieval_trace_items)
+            log_step(f"short_memory.retrieval_method[{retrieval_method}]")
             await asyncio.to_thread(
                 memory_service.log_retrieval_decision,
                 trace_id=request_id,
@@ -622,8 +703,51 @@ async def handle_chat_completions(request: Request) -> Any:
                 retrieved_items=retrieval_trace_items,
                 method_used=retrieval_method,
             )
+            log_step("short_memory.log_retrieval_decision.done")
             query_matched_memories = matched_memories_for_query(user_text, select_context_memories(user_text, memories))
+            log_step(f"short_memory.query_match.done[{len(query_matched_memories)}]")
+            if not query_matched_memories:
+                log_step(
+                    f"short_memory.zero_match_snapshot[n_memories={len(memories)}|n_trace={len(retrieval_trace_items)}]"
+                )
+            retrieval_pool = memories if memories else retrieval_trace_items
+            if memories and len(retrieval_trace_items) != len(memories):
+                log_step(
+                    f"short_memory.trace_pool_mismatch[memories={len(memories)}|trace={len(retrieval_trace_items)}]"
+                )
+            if not query_matched_memories and retrieval_pool:
+                log_step(f"short_memory.unmatched_use_retrieval_pool[{len(retrieval_pool)}]")
+                fallback_matches = fallback_context_memories_when_unmatched(
+                    user_text=user_text,
+                    retrieved_items=retrieval_pool,
+                    limit=3,
+                )
+                if fallback_matches:
+                    query_matched_memories = fallback_matches
+                    log_step(f"short_memory.query_match.fallback_topk[{len(query_matched_memories)}]")
+                if not query_matched_memories:
+                    if not MEMORY_SEMANTIC_CONTEXT_FALLBACK_ENABLED:
+                        log_step("short_memory.query_match.semantic_fallback.skipped[disabled]")
+                    elif blocks_semantic_memory_context_fallback(user_text):
+                        log_step("short_memory.query_match.semantic_fallback.skipped[blocked_profile_intent]")
+                    else:
+                        semantic_matches = memories_for_semantic_context_fallback(
+                            user_text,
+                            retrieval_pool,
+                            limit=3,
+                            min_score=MEMORY_SEMANTIC_CONTEXT_FALLBACK_MIN_SCORE,
+                            min_overlap=MEMORY_SEMANTIC_CONTEXT_FALLBACK_MIN_TOKEN_OVERLAP,
+                            max_chars=MEMORY_SEMANTIC_CONTEXT_FALLBACK_MAX_CHARS,
+                        )
+                        if semantic_matches:
+                            query_matched_memories = semantic_matches
+                            log_step(f"short_memory.query_match.semantic_fallback[{len(query_matched_memories)}]")
+                        else:
+                            log_step(
+                                f"short_memory.query_match.semantic_fallback.skipped[no_eligible_items|pool={len(retrieval_pool)}]"
+                            )
             if not query_matched_memories and detect_fact_slots(user_text):
+                log_step("short_memory.long_term_slot_lookup.start")
                 trusted = await asyncio.to_thread(
                     memory_service.list_long_term_slot_facts,
                     query=user_text,
@@ -631,13 +755,16 @@ async def handle_chat_completions(request: Request) -> Any:
                     limit=20,
                 )
                 if not trusted:
+                    log_step("short_memory.profile_facts_lookup.start")
                     trusted = await asyncio.to_thread(
                         memory_service.list_profile_facts,
                         memory_scope=memory_scope,
                         limit=20,
                     )
                 query_matched_memories = matched_memories_for_query(user_text, trusted)
+                log_step(f"short_memory.long_term_slot_lookup.done[{len(query_matched_memories)}]")
             if not query_matched_memories and is_personal_memory_query(user_text):
+                log_step("short_memory.cross_scope_short_lookup.start")
                 cross_tab_short = (
                     await asyncio.to_thread(
                         memory_service.list_short_term_slot_facts_any_scope,
@@ -655,7 +782,9 @@ async def handle_chat_completions(request: Request) -> Any:
                         user_text,
                         select_context_memories(user_text, cross_tab_short),
                     )
+                log_step(f"short_memory.cross_scope_short_lookup.done[{len(query_matched_memories)}]")
             llm_messages = inject_memory_context(messages, query_matched_memories)
+            log_step(f"short_memory.inject_context.done[{len(query_matched_memories)}]")
         except Exception as exc:
             await asyncio.to_thread(
                 memory_service.log_retrieval_decision,
@@ -665,6 +794,7 @@ async def handle_chat_completions(request: Request) -> Any:
                 retrieved_items=[],
                 method_used="structured",
             )
+            log_step("short_memory.retrieve.failed")
             logger.warning("Memory retrieval failed: %s", exc)
 
     if has_multimodal(llm_messages) and not VISION_MODEL:
@@ -829,6 +959,46 @@ async def handle_chat_completions(request: Request) -> Any:
 
             return StreamingResponse(missing_memory_stream(), media_type="text/event-stream")
 
+    if (
+        MEMORY_ENABLED
+        and user_text
+        and is_personal_memory_query(user_text)
+        and query_matched_memories
+        and not has_multimodal(llm_messages)
+    ):
+        memory_fast_answer = build_memory_fallback_answer(user_text, query_matched_memories)
+        if not memory_fast_answer:
+            memory_fast_answer = resolve_local_personal_fallback(
+                user_text=user_text,
+                memory_scope=memory_scope,
+                query_matched_memories=query_matched_memories,
+            )
+        if memory_fast_answer:
+            if MEMORY_ENABLED and user_text:
+                memory_service.log_chat_trace(
+                    request_id=request_id,
+                    memory_scope=memory_scope,
+                    user_text=user_text,
+                    assistant_text=memory_fast_answer,
+                    model="memory-fastpath",
+                    retrieved_items=retrieval_trace_items,
+                    had_error=False,
+                )
+            if not stream:
+                log_step("build_non_stream_response.memory_fastpath")
+                return build_non_stream_response(tool_prefix + memory_fast_answer)
+
+            async def memory_fast_stream():
+                yield ":\n\n"
+                if tool_prefix:
+                    yield sse_data(build_chunk_payload(chunk_id="tool", delta_content=tool_prefix))
+                yield sse_data(build_chunk_payload(chunk_id="memory-fastpath", delta_content=memory_fast_answer))
+                yield sse_data(build_chunk_payload(chunk_id="memory-fastpath", finish_reason="stop"))
+                log_step("stream_response.done.memory_fastpath")
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(memory_fast_stream(), media_type="text/event-stream")
+
     if not stream:
         try:
             if has_multimodal(llm_messages):
@@ -883,6 +1053,7 @@ async def handle_chat_completions(request: Request) -> Any:
                     user_text=user_text,
                     assistant_text=text,
                     memory_scope=memory_scope,
+                    on_step=log_step,
                 )
                 log_step("memory_service.log_chat_trace.non_stream")
                 memory_service.log_chat_trace(
@@ -989,6 +1160,7 @@ async def handle_chat_completions(request: Request) -> Any:
                         user_text=user_text,
                         assistant_text=vision_text,
                         memory_scope=memory_scope,
+                        on_step=log_step,
                     )
                     log_step("memory_service.log_chat_trace.stream_vision")
                     memory_service.log_chat_trace(
@@ -1027,9 +1199,81 @@ async def handle_chat_completions(request: Request) -> Any:
                 yield "data: [DONE]\n\n"
                 return
         collected_tokens: list[str] = []
+        token_count = 0
+        first_token_seen = False
         try:
             log_step("stream_llm.stream")
-            async for token in stream_llm(llm_messages, model=upstream_model):
+            stream_iter = stream_llm(llm_messages, model=upstream_model).__aiter__()
+            pending_next: asyncio.Task[str] | None = None
+            next_text_status_at_s = float(TEXT_STREAM_STATUS_INTERVAL_SECONDS)
+            text_stream_started_at = time.perf_counter()
+            first_token_timeout_s = float(TEXT_STREAM_FIRST_TOKEN_TIMEOUT_SECONDS)
+            while True:
+                if pending_next is None:
+                    pending_next = asyncio.create_task(stream_iter.__anext__())
+                try:
+                    token = await asyncio.wait_for(
+                        asyncio.shield(pending_next),
+                        timeout=float(TEXT_STREAM_STATUS_INTERVAL_SECONDS),
+                    )
+                    pending_next = None
+                except asyncio.TimeoutError:
+                    if not first_token_seen:
+                        elapsed_s = int(time.perf_counter() - text_stream_started_at)
+                        if elapsed_s >= int(first_token_timeout_s):
+                            if pending_next:
+                                pending_next.cancel()
+                                with contextlib.suppress(asyncio.CancelledError):
+                                    await pending_next
+                                pending_next = None
+                            fallback_answer = None
+                            if MEMORY_ENABLED and user_text and is_personal_memory_query(user_text):
+                                fallback_answer = resolve_local_personal_fallback(
+                                    user_text=user_text,
+                                    memory_scope=memory_scope,
+                                    query_matched_memories=query_matched_memories,
+                                )
+                            if (
+                                not fallback_answer
+                                and TEXT_STREAM_TIMEOUT_FALLBACK_MODEL
+                                and TEXT_STREAM_TIMEOUT_FALLBACK_MODEL != upstream_model
+                            ):
+                                try:
+                                    log_step("stream_llm.first_token_timeout.fallback_model.start")
+                                    fallback_answer = await asyncio.wait_for(
+                                        complete_llm(
+                                            llm_messages,
+                                            model=TEXT_STREAM_TIMEOUT_FALLBACK_MODEL,
+                                        ),
+                                        timeout=20.0,
+                                    )
+                                    if fallback_answer:
+                                        log_step("stream_llm.first_token_timeout.fallback_model.success")
+                                except Exception:
+                                    log_step("stream_llm.first_token_timeout.fallback_model.failed")
+                            if fallback_answer:
+                                yield sse_data(build_chunk_payload(chunk_id="memory-fallback", delta_content=fallback_answer))
+                            else:
+                                yield sse_data(
+                                    build_chunk_payload(
+                                        chunk_id="error",
+                                        delta_content=(
+                                            f"[ERROR] Upstream first token timed out after {int(first_token_timeout_s)}s. "
+                                            "Please retry or use a faster model."
+                                        ),
+                                        finish_reason="stop",
+                                    )
+                                )
+                            log_step("stream_response.done.first_token_timeout")
+                            yield "data: [DONE]\n\n"
+                            return
+                        if elapsed_s >= int(next_text_status_at_s):
+                            yield f"event: status\ndata: {json.dumps({'message': f'Still generating response... ({elapsed_s}s)'})}\n\n"
+                            log_step("text_stream.waiting_first_token_status_sent")
+                            next_text_status_at_s += float(TEXT_STREAM_STATUS_INTERVAL_SECONDS)
+                    continue
+                except StopAsyncIteration:
+                    break
                 if token:
                     if is_upstream_error_token(token):
                         persist_user_memory_on_failure(user_text=user_text, memory_scope=memory_scope)
@@ -1054,9 +1298,16 @@ async def handle_chat_completions(request: Request) -> Any:
                         log_step("stream_response.done.upstream_error_token")
                         yield "data: [DONE]\n\n"
                         return
+                    token_count += 1
+                    if not first_token_seen:
+                        log_step("stream_llm.first_token")
+                        first_token_seen = True
+                    elif token_count % 100 == 0:
+                        log_step(f"stream_llm.token_progress[{token_count}]")
                     collected_tokens.append(token)
                     if not is_vision_request and not hold_personal_stream:
                         yield sse_data(build_chunk_payload(chunk_id="chatcmpl-local", delta_content=token))
+            log_step(f"stream_llm.done[{token_count}]")
         except Exception as exc:
             persist_user_memory_on_failure(user_text=user_text, memory_scope=memory_scope)
             fallback_answer = build_memory_fallback_answer(user_text, query_matched_memories)
@@ -1115,6 +1366,7 @@ async def handle_chat_completions(request: Request) -> Any:
                 user_text=user_text,
                 assistant_text=final_text,
                 memory_scope=memory_scope,
+                on_step=log_step,
             )
             log_step("memory_service.log_chat_trace.stream")
             memory_service.log_chat_trace(

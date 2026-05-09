@@ -12,6 +12,7 @@ from sqlalchemy.exc import OperationalError
 from config import (
     LEGACY_WRITE_ENABLED,
     LEGACY_READ_FALLBACK_ENABLED,
+    LONG_TERM_PROMOTE_MIN_SCORE,
     MEMORY_AUTO_STORE,
     MEMORY_MAX_ITEMS,
     MEMORY_MIN_SCORE,
@@ -972,9 +973,14 @@ class MemoryService:
         legacy_items = [self._legacy_row_to_memory_item(r) for r in rows]
         if not long_items:
             return legacy_items
-        # Keep long_* as source of truth while preserving useful legacy profile_full context.
-        profile_full_items = [item for item in legacy_items if str(item.get("source") or "").strip().lower() == "profile_full"]
-        merged = long_items + profile_full_items
+        # Keep long_* as source of truth while preserving useful legacy profile
+        # rows (profile_fact/profile_full) for backward compatibility.
+        legacy_profile_items = [
+            item
+            for item in legacy_items
+            if str(item.get("source") or "").strip().lower() in {"profile_fact", "profile_full"}
+        ]
+        merged = long_items + legacy_profile_items
         return merged[: max(1, limit)]
 
     def list_profile_facts_any_scope(self, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -1348,7 +1354,7 @@ class MemoryService:
         classification: dict[str, Any],
     ) -> bool:
         score = max(0.0, min(1.0, float(classification.get("importance_score") or 0.0)))
-        if score < 0.6:
+        if score < LONG_TERM_PROMOTE_MIN_SCORE:
             return False
         raw = (text or "").strip()
         if not raw:
@@ -2089,6 +2095,13 @@ class MemoryService:
             category=classification["category"],
             structured_data=classification["structured_data"],
         )
+        prom_score = max(0.0, min(1.0, float(classification.get("importance_score") or 0.0)))
+        if prom_score >= LONG_TERM_PROMOTE_MIN_SCORE:
+            self._promote_user_fact_to_long_term(
+                memory_scope=memory_scope,
+                text=t,
+                classification=classification,
+            )
 
     def _heuristic_classify_memory_candidate(self, text: str) -> dict[str, Any]:
         t = (text or "").strip()
@@ -2107,11 +2120,14 @@ class MemoryService:
             if match:
                 extracted[key] = match.group(0).strip()
 
-        for key in ("name", "university", "location", "company", "role", "hobby", "favorite"):
+        for key in ("name", "university", "education", "location", "company", "role", "hobby", "favorite"):
             m = re.search(rf"\b{key}\s*:\s*([^\n]{{2,160}})", t, flags=re.IGNORECASE)
             if m:
                 extracted[key] = m.group(1).strip()
 
+        if extracted.get("education"):
+            category = "education"
+            score = max(score, 0.85)
         if any(k in lowered for k in ("my name is", "i am ", "name:", "আমার নাম")):
             category = "person"
             score = max(score, 0.9)
@@ -2131,7 +2147,7 @@ class MemoryService:
             category = "contact"
             score = max(score, 0.9)
 
-        should_store = score >= 0.6
+        should_store = score >= LONG_TERM_PROMOTE_MIN_SCORE
         return {
             "should_store": should_store,
             "importance_score": min(1.0, score),

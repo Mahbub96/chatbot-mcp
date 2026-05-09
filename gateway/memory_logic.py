@@ -6,6 +6,22 @@ from typing import Any
 MIN_MEMORY_FACT_CONFIDENCE = 0.75
 
 
+def effective_memory_confidence(item: dict[str, Any]) -> float:
+    """Use source-aware default confidence when explicit value is missing."""
+    raw_conf = item.get("confidence")
+    if raw_conf is not None:
+        try:
+            return float(raw_conf)
+        except (TypeError, ValueError):
+            return 0.0
+    source = (item.get("source") or "").strip().lower()
+    if source in {"profile_fact", "manual"}:
+        return 1.0
+    if source == "profile_full":
+        return 0.85
+    return 0.0
+
+
 def select_context_memories(user_text: str, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized_query = (user_text or "").strip().lower()
     selected: list[dict[str, Any]] = []
@@ -552,7 +568,7 @@ def build_memory_fallback_answer(user_text: str, memories: list[dict[str, Any]])
         for item in memories:
             top_text = (item.get("text") or "").strip()
             source = (item.get("source") or "").strip().lower()
-            confidence = float(item.get("confidence") or 0.0)
+            confidence = effective_memory_confidence(item)
             if confidence < MIN_MEMORY_FACT_CONFIDENCE:
                 continue
             if not top_text or is_low_quality_memory_text(top_text) or has_question_like_shape(top_text):
@@ -585,7 +601,7 @@ def build_memory_fallback_answer(user_text: str, memories: list[dict[str, Any]])
     for item in memories:
         top_text = (item.get("text") or "").strip()
         source = (item.get("source") or "").strip().lower()
-        confidence = float(item.get("confidence") or 0.0)
+        confidence = effective_memory_confidence(item)
         if confidence < MIN_MEMORY_FACT_CONFIDENCE:
             continue
         if not top_text or is_low_quality_memory_text(top_text) or has_question_like_shape(top_text):
@@ -654,7 +670,6 @@ def extract_profile_full_slot_fact(query_text: str, profile_text: str) -> str | 
     normalized = " ".join(raw.replace("\\n", "\n").split())
     if len(normalized) > 3000:
         normalized = normalized[:3000]
-    lower = normalized.lower()
     slot_keywords: dict[str, tuple[str, ...]] = {
         "work": ("work", "worked", "office", "company", "employer", "role", "experience", "brotecs"),
         "university": ("university", "education", "varsity", "campus"),
@@ -712,7 +727,7 @@ def build_memory_first_answer(user_text: str, memories: list[dict[str, Any]]) ->
     top = memories[0]
     top_source = (top.get("source") or "").strip().lower()
     top_text = (top.get("text") or "").strip()
-    top_confidence = float(top.get("confidence") or 0.0)
+    top_confidence = effective_memory_confidence(top)
     if top_confidence < MIN_MEMORY_FACT_CONFIDENCE:
         return None
     if not top_text or is_low_quality_memory_text(top_text):
@@ -768,6 +783,40 @@ def is_personal_memory_query(text: str) -> bool:
     return any(sig in t for sig in personal_signals)
 
 
+def blocks_semantic_memory_context_fallback(text: str) -> bool:
+    """
+    True → skip generic vector-snippet injection; structured personal/slot flows should win.
+    Narrower than is_personal_memory_query: avoids blocking on bare substrings like 'work' in 'network'.
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    lower = t.lower()
+    if "আমার" in t:
+        return True
+    explicit_self = (
+        "information about me",
+        "info about me",
+        "tell me about my",
+        "tell me about myself",
+        "about myself",
+        "who am i",
+    )
+    if any(p in lower for p in explicit_self):
+        return True
+    if re.search(
+        r"\b(my|amar)\s+(full\s+)?name\b|\b(my|amar)\s+"
+        r"(university|email|cv|resume|company|office|employer|job|role|profession|occupation|hobby|address)\b|\b(my|amar)\s+work(?:place)?\b",
+        lower,
+    ):
+        return True
+    if re.search(r"\b(what|where|who|which|when)\s+(is|are|was|were|'s)\s+(my|amar)\b", lower):
+        return True
+    if re.search(r"\b(where|how)\s+do\s+i\s+work\b", lower):
+        return True
+    return False
+
+
 def build_memory_missing_answer(user_text: str) -> str | None:
     if not is_personal_memory_query(user_text):
         return None
@@ -817,6 +866,110 @@ def should_reject_personal_answer(
         if top_text and text_token_overlap(answer, top_text) < 0.08 and query_slots:
             return True
     return False
+
+
+def memory_has_structural_noise(text: str) -> bool:
+    """Prompt-shaped / log-shaped markers only (no length heuristic)."""
+    lower = (text or "").strip().lower()
+    if not lower:
+        return True
+    bad_signals = (
+        "### task:",
+        "<chat_history>",
+        "json format:",
+        "follow_ups",
+        "guidelines:",
+        "output:",
+    )
+    return any(sig in lower for sig in bad_signals)
+
+
+def clip_memory_text_for_context(text: str, max_chars: int) -> str:
+    t = " ".join((text or "").strip().split())
+    if len(t) <= max_chars:
+        return t
+    return (t[: max(1, max_chars - 3)].rstrip() + "...")
+
+
+_SEM_FALLBACK_UNCERTAINTY_MARKERS = (
+    "no marker set",
+    "i don't have",
+    "i do not have",
+    "couldn't find",
+    "not sure",
+    "not fully verified",
+    "possible memory",
+)
+
+
+def _semantic_context_fallback_item_eligible(
+    query: str,
+    item: dict[str, Any],
+    *,
+    min_score: float,
+    min_overlap: float,
+) -> bool:
+    text = (item.get("text") or "").strip()
+    if not text or memory_has_structural_noise(text) or has_question_like_shape(text):
+        return False
+    source = (item.get("source") or "").strip().lower()
+    structured = item.get("structured_data") if isinstance(item.get("structured_data"), dict) else {}
+    source_field = str(structured.get("source_field") or "").strip().lower()
+    if source == "chat_assistant":
+        if len(text) > 800 or float(item.get("importance") or 0.0) < 0.35:
+            return False
+        lowered = text.lower()
+        if text.startswith("I ") and ("don't have" in lowered or "couldn't find" in lowered):
+            return False
+    if source == "short_trace_context" and source_field == "assistant_response":
+        lowered = text.lower()
+        if any(marker in lowered for marker in _SEM_FALLBACK_UNCERTAINTY_MARKERS):
+            return False
+    sc = float(item.get("score") or 0.0)
+    ov = text_token_overlap(query, text)
+    return (
+        sc >= min_score
+        or (sc <= 0.0 and ov >= min_overlap)
+        or (sc >= min_score * 0.85 and ov >= min_overlap * 0.9)
+    )
+
+
+def memories_for_semantic_context_fallback(
+    query_text: str,
+    retrieved_items: list[dict[str, Any]],
+    *,
+    limit: int = 3,
+    min_score: float = 0.2,
+    min_overlap: float = 0.12,
+    max_chars: int = 520,
+) -> list[dict[str, Any]]:
+    """
+    When strict slot/overlap matching yields nothing, inject top retrieval hits for non-personal
+    prompts using vector score and/or token overlap, with truncation and hygiene gates.
+    """
+    query = (query_text or "").strip()
+    if not query or not retrieved_items:
+        return []
+    lim = max(1, int(limit))
+    ranked: list[tuple[tuple[float, float, int, float], dict[str, Any]]] = []
+    for item in retrieved_items:
+        if not isinstance(item, dict):
+            continue
+        text = (item.get("text") or "").strip()
+        if not text or not _semantic_context_fallback_item_eligible(
+            query, item, min_score=min_score, min_overlap=min_overlap
+        ):
+            continue
+        clipped = clip_memory_text_for_context(text, max_chars)
+        if not clipped:
+            continue
+        sc = float(item.get("score") or 0.0)
+        ov = text_token_overlap(query, text)
+        sp = source_priority(str(item.get("source") or ""))
+        imp = float(item.get("importance") or 0.0)
+        ranked.append(((sc, ov, sp, imp), {**item, "text": clipped}))
+    ranked.sort(key=lambda row: row[0], reverse=True)
+    return [row[1] for row in ranked[:lim]]
 
 
 def user_disputes_identity(text: str) -> bool:

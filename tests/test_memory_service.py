@@ -78,6 +78,21 @@ class MemoryServiceTest(unittest.TestCase):
         self.assertNotIn("usepackage:", joined)
         self.assertNotIn("href:", joined)
 
+    def test_heuristic_classifies_education_colon_fact(self):
+        r = memory_service.classify_memory_candidate("education: Stamford Example College")
+        self.assertTrue(r["should_store"])
+        self.assertEqual((r.get("structured_data") or {}).get("education", "").lower(), "stamford example college")
+
+    def test_assistant_turn_promotes_structured_fact_to_long_term(self):
+        scope = "test-assistant-longterm-scope"
+        memory_service.maybe_store_from_assistant_turn(
+            text="Acknowledged — university: LTFixture Polytechnic for your academic records.",
+            memory_scope=scope,
+        )
+        facts = memory_service.list_long_term_slot_facts(query="university", memory_scope=scope, limit=20)
+        texts = [f.get("text", "").lower() for f in facts]
+        self.assertTrue(any("ltfixture polytechnic" in t for t in texts))
+
     def test_assistant_turn_store_has_quality_guard(self):
         scope = "test-assistant-store-scope"
         memory_service.maybe_store_from_assistant_turn(
