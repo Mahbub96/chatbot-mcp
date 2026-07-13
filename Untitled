@@ -1,0 +1,28 @@
+# Agent Instructions
+
+## Source of truth
+
+1. `docs/PRD.md` defines product requirements.
+2. `docs/ARCHITECTURE.md` defines system boundaries.
+3. `docs/CURRENT_PHASE.md` defines current scope.
+4. The existing code and tests define current behavior.
+
+If documentation conflicts with code, do not guess. Report the conflict.
+
+## Mandatory workflow
+
+1. Inspect the relevant implementation and tests.
+2. Identify affected components.
+3. Provide a short implementation plan.
+4. Make the smallest architecture-compatible change.
+5. Add or update tests.
+6. Run relevant validation commands.
+7. Report changes, tests, and remaining risks.
+
+## Restrictions
+
+- Never expose secrets.
+- Never silently enable network access.
+- Never claim a tool action succeeded without evidence.
+- Never introduce future-phase functionality into MVP tasks.
+- Never remove user changes unrelated to the task.
